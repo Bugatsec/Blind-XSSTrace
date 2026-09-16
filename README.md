@@ -20,6 +20,15 @@ Blind XSS testing is painful when your callback tooling does not give you enough
 - Classic XSS Hunter-style setups are useful, but many workflows end up with one generic payload path.
 - When testing many fields, forms, endpoints, and roles, you need to know exactly which payload fired.
 
+
+
+
+
+
+
+
+
+
 The problem is simple:
 
 When you test many different fields, forms, endpoints, accounts, and roles, a generic Blind XSS callback only tells you that **something fired**. It does not always clearly tell you **which exact injection point caused the hit**.

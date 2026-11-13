@@ -24,7 +24,7 @@ A self-hosted Blind XSS payload server and hit dashboard with unlimited markers,
 - [Environment variables](#environment-variables)
 - [Free persistence with Upstash Redis](#free-persistence-with-upstash-redis)
 - [Persistent disk (optional)](#persistent-disk-optional)
-- [Connecting a custom domain](#connecting-a-custom-domain)
+- [Connecting a custom domain (optional)](#connecting-a-custom-domain-optional)
 - [Test page](#test-page)
 - [Using the payloads](#using-the-payloads)
 - [The dashboard](#the-dashboard)
@@ -191,7 +191,7 @@ A `render.yaml` blueprint is included. The fastest path:
 3. Render reads `render.yaml` and creates a **free** Node web service using:
    - Build command: `npm install`
    - Start command: `npm start`
-4. Fill in the environment variables when prompted (see below). At minimum set `PUBLIC_BASE_URL`, `DASHBOARD_USERNAME`, `DASHBOARD_PASSWORD` and `SESSION_SECRET`.
+4. Fill in the environment variables when prompted (see below). At minimum set `DASHBOARD_USERNAME`, `DASHBOARD_PASSWORD` and `SESSION_SECRET`. Set `PUBLIC_BASE_URL` to your public URL, or leave it unset on Render to use `RENDER_EXTERNAL_URL` (the `*.onrender.com` domain works fine).
 5. Deploy, then open `https://<your-service>.onrender.com/dashboard`.
 
 Manual setup (without the blueprint) uses the same build/start commands and the same environment variables.
@@ -202,7 +202,7 @@ Render free services spin down after inactivity. The first request after a spin-
 
 | Variable | Required | Example | Description |
 | --- | --- | --- | --- |
-| `PUBLIC_BASE_URL` | Yes (in production) | `https://xss.yourdomain.com` | Public origin used in payloads, Discord links and the cookie `Secure` flag. No trailing slash. Falls back to Render's `RENDER_EXTERNAL_URL`, then `http://localhost:PORT`. |
+| `PUBLIC_BASE_URL` | Recommended (required outside Render) | `https://xss.yourdomain.com` or `https://your-service.onrender.com` | Public origin used in payloads, Discord links and the cookie `Secure` flag. No trailing slash. Falls back to Render's `RENDER_EXTERNAL_URL`, then `http://localhost:PORT`. |
 | `DASHBOARD_USERNAME` | Yes | `admin` | Dashboard login username. |
 | `DASHBOARD_PASSWORD` | Yes | `use-a-long-password` | Dashboard login password. |
 | `SESSION_SECRET` | Strongly recommended | `long-random-string` | HMAC key for the session cookie. Falls back to `DASHBOARD_PASSWORD` if unset. |
@@ -275,9 +275,19 @@ If you are on a paid Render plan, you can attach a disk instead of (or in additi
 
 The log is then stored at `/var/data/callbacks.jsonl` and survives redeploys.
 
-## Connecting a custom domain
+## Connecting a custom domain (optional)
 
-Use a dedicated subdomain, for example `xss.yourdomain.com`:
+A custom domain is **not required**. The default Render URL works perfectly well as your payload base and dashboard, for example:
+
+```text
+Blind XSS server:   https://your-service.onrender.com
+Dashboard:          https://your-service.onrender.com/dashboard
+Payload base:       https://your-service.onrender.com/x/<marker>
+```
+
+If you use the Render URL, either leave `PUBLIC_BASE_URL` unset (the server falls back to Render's `RENDER_EXTERNAL_URL`) or set it explicitly to `https://your-service.onrender.com` so generated payloads and Discord links always use the correct origin. You can add a custom domain later without changing your payload markers.
+
+If you do have a domain, use a dedicated subdomain, for example `xss.yourdomain.com`:
 
 ```text
 Main website:       https://yourdomain.com

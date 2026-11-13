@@ -4,11 +4,15 @@
   "description": "Self-hosted Blind XSS testing dashboard with unlimited payload markers, callback logging, page grouping, Discord alerts, and import/export.",
   "main": "server.js",
   "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.22.3",
+    "multer": "^2.4.0"
   }
 }

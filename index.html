@@ -61,8 +61,12 @@
   <main>
     <h1>XSSTrace</h1>
     <p>Serve Blind XSS payloads from scoped marker URLs and review callbacks in a password-protected dashboard.</p>
-    <code>&lt;script src="https://xss.example.com/x/blind-xss"&gt;&lt;/script&gt;</code>
-    <p><a href="/dashboard">Open dashboard</a></p>
+    <code>&lt;script src="https://xss.yourdomain.com/x/blind-xss"&gt;&lt;/script&gt;</code>
+    <p>
+      <a href="/dashboard">Open dashboard</a>
+      &nbsp;
+      <a href="/test" style="background: var(--panel); color: var(--accent); border: 1px solid var(--line);">Run self-test</a>
+    </p>
   </main>
 </body>
 </html>

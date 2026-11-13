@@ -17,4 +17,10 @@ services:
       - key: DISCORD_WEBHOOK_URL
         sync: false
       - key: DATA_DIR
-        value: /var/data
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: UPSTASH_REDIS_KEY
+        value: xsstrace:callbacks

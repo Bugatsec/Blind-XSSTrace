@@ -9,7 +9,8 @@
 A self-hosted Blind XSS payload server and hit dashboard with unlimited markers, page grouping, filters, import/export, screenshots, storage capture and Discord alerts.
 
 <img width="1906" height="905" alt="image" src="https://github.com/user-attachments/assets/ef51872a-5811-441e-a39e-45f05dabc43f" />
-<img width="1898" height="592" alt="image" src="https://github.com/user-attachments/assets/b08233d7-66bf-48f9-a4d8-f3a6310d2b4a" />
+<img width="1919" height="576" alt="image" src="https://github.com/user-attachments/assets/0be6b493-1464-458f-966d-48d9159546d8" />
+
 
 ## Table of contents
 
@@ -345,7 +346,8 @@ Open:
 https://xss.yourdomain.com/dashboard
 ```
 <img width="1906" height="905" alt="image" src="https://github.com/user-attachments/assets/ef51872a-5811-441e-a39e-45f05dabc43f" />
-<img width="1898" height="592" alt="image" src="https://github.com/user-attachments/assets/b08233d7-66bf-48f9-a4d8-f3a6310d2b4a" />
+<img width="1919" height="576" alt="image" src="https://github.com/user-attachments/assets/636972c5-457c-427d-9efd-21c7908b30ec" />
+
 
 Features:
 

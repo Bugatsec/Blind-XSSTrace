@@ -8,7 +8,8 @@
 
 A self-hosted Blind XSS payload server and hit dashboard with unlimited markers, page grouping, filters, import/export, screenshots, storage capture and Discord alerts.
 
-<img width="1902" height="955" alt="XSSTrace dashboard" src="https://github.com/user-attachments/assets/98cf2d38-749c-4a0a-9062-d9d5cae1ad10" />
+<img width="1906" height="905" alt="image" src="https://github.com/user-attachments/assets/ef51872a-5811-441e-a39e-45f05dabc43f" />
+<img width="1898" height="592" alt="image" src="https://github.com/user-attachments/assets/b08233d7-66bf-48f9-a4d8-f3a6310d2b4a" />
 
 ## Table of contents
 
@@ -343,6 +344,8 @@ Open:
 ```text
 https://xss.yourdomain.com/dashboard
 ```
+<img width="1906" height="905" alt="image" src="https://github.com/user-attachments/assets/ef51872a-5811-441e-a39e-45f05dabc43f" />
+<img width="1898" height="592" alt="image" src="https://github.com/user-attachments/assets/b08233d7-66bf-48f9-a4d8-f3a6310d2b4a" />
 
 Features:
 
@@ -365,6 +368,7 @@ Features:
 Each hit sends an embed with marker, source, IP, page, user agent, page title, cookies, `localStorage`, `sessionStorage`/request headers, raw body when present, and a dashboard link. Screenshots are attached inline. Long bodies are split across messages instead of being silently truncated.
 
 The crawler user agent `facebookexternalhit/1.1` is ignored to avoid noisy alerts.
+<img width="221" height="606" alt="image" src="https://github.com/user-attachments/assets/103ace92-0fb5-4c94-80a7-3ee255c8e0a9" />
 
 ## What gets captured
 
@@ -449,7 +453,7 @@ Too many failed attempts from your IP. Wait 10 minutes.
 
 ## Credits
 
-- `bugatsec.js` is based on the [XSS Hunter Express](https://github.com/xss-hunter/xss-hunter-express) payload, and bundles [html2canvas](https://html2canvas.hertzen.com/) (MIT), [StackBlur](https://github.com/flozz/StackBlur) and [OpenPGP.js](https://www.openpgp.org/) for screenshots and optional PGP encryption.
+- `bugatsec.js` is based on the [XSS Hunter Express](https://github.com/xss-hunter/xss-hunter-express) payload, and bundles [html2canvas](https://html2canvas.hertzen.com/) (MIT) and [OpenPGP.js](https://www.openpgp.org/) for screenshots and optional PGP encryption.
 - The dashboard and server are original work released under the MIT license below.
 
 ## License
